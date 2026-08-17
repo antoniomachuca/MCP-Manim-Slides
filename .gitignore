@@ -48,6 +48,7 @@ manim.cfg
 # Manim Slides specific
 slides/
 *.html
+*.mp4
 
 # IDEs
 .idea/

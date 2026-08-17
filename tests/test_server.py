@@ -7,13 +7,21 @@ from pathlib import Path
 import pytest
 
 from src.server import (
+    REVEAL_THEMES,
+    REVEAL_TRANSITION_SPEEDS,
+    REVEAL_TRANSITIONS,
     _build_convert_command,
     _build_render_command,
+    _build_reveal_config,
+    _build_revealjs_export_command,
     _temporary_script,
+    _validate_reveal_options,
     compile_presentation,
     execute_manim_code,
+    export_revealjs_html,
     hello_world,
     mcp,
+    revealjs_config_options,
     server_status,
 )
 
@@ -48,6 +56,7 @@ async def test_server_list_resources():
     resources = await mcp.list_resources()
     resource_uris = [str(r.uri) for r in resources]
     assert any("status://server" in uri for uri in resource_uris)
+    assert any("revealjs://config" in uri for uri in resource_uris)
 
 
 @pytest.mark.anyio
@@ -112,6 +121,139 @@ def test_build_convert_command_full_options():
     ]
 
 
+def test_build_reveal_config_defaults():
+    """Verify default Reveal.js config produces expected -c key=value pairs."""
+    args = _build_reveal_config()
+    assert args == [
+        "-c",
+        "reveal_theme=black",
+        "-c",
+        "transition='none'",
+        "-c",
+        "transition_speed='default'",
+        "-c",
+        "controls=false",
+        "-c",
+        "progress=false",
+        "-c",
+        "slide_number=false",
+        "-c",
+        "hash=false",
+        "-c",
+        "loop=false",
+    ]
+
+
+def test_build_reveal_config_full_options():
+    """Verify custom Reveal.js options are converted to converter arguments."""
+    args = _build_reveal_config(
+        theme="moon",
+        transition="slide",
+        transition_speed="fast",
+        controls=True,
+        progress=True,
+        slide_number=True,
+        hash=True,
+        loop=True,
+        title="My Deck",
+        config={"background_color": "white"},
+    )
+    assert args.count("-c") == 10
+    assert "reveal_theme=moon" in args
+    assert "transition='slide'" in args
+    assert "transition_speed='fast'" in args
+    assert "controls=true" in args
+    assert "progress=true" in args
+    assert "slide_number=true" in args
+    assert "hash=true" in args
+    assert "loop=true" in args
+    assert "title=My Deck" in args
+    assert "background_color=white" in args
+
+
+def test_build_revealjs_export_command_defaults():
+    """Verify Reveal.js export builds a convert command targeting html."""
+    command = _build_revealjs_export_command(scenes=["MySlide"], dest="deck.html")
+    args = command[command.index("convert") :]
+    assert args[0] == "convert"
+    assert args[1:5] == ["--folder", "slides", "--to", "html"]
+    assert "MySlide" in args
+    assert args[-1] == "deck.html"
+
+
+def test_build_revealjs_export_command_full_options():
+    """Verify all Reveal.js flags (one-file, offline) are forwarded correctly."""
+    command = _build_revealjs_export_command(
+        scenes=["SceneA", "SceneB"],
+        dest="deck.html",
+        folder="media",
+        theme="sky",
+        transition="fade",
+        one_file=True,
+        offline=True,
+    )
+    args = command[command.index("convert") :]
+    assert args[1:5] == ["--folder", "media", "--to", "html"]
+    assert "--one-file" in args
+    assert "--offline" in args
+    assert "reveal_theme=sky" in args
+    assert "transition='fade'" in args
+    assert args[-3:] == ["SceneA", "SceneB", "deck.html"]
+
+
+def test_validate_reveal_options_valid():
+    """Verify valid theme, transition, and speed produce no error."""
+    assert _validate_reveal_options("moon", "slide", "fast") is None
+
+
+def test_validate_reveal_options_invalid_theme():
+    """Verify an invalid theme returns a descriptive error message."""
+    error = _validate_reveal_options("rainbow", "none", "default")
+    assert error is not None
+    assert "rainbow" in error
+    assert "theme" in error
+
+
+def test_validate_reveal_options_invalid_transition():
+    """Verify an invalid transition returns a descriptive error message."""
+    error = _validate_reveal_options("black", "explode", "default")
+    assert error is not None
+    assert "explode" in error
+    assert "transition" in error
+
+
+def test_validate_reveal_options_invalid_speed():
+    """Verify an invalid transition speed returns a descriptive error message."""
+    error = _validate_reveal_options("black", "none", "ludicrous")
+    assert error is not None
+    assert "ludicrous" in error
+    assert "speed" in error
+
+
+def test_export_revealjs_html_invalid_theme(monkeypatch):
+    """Verify invalid theme is rejected before invoking the converter."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="Done"),
+    )
+    result = json.loads(
+        export_revealjs_html(scenes=["MySlide"], dest="deck.html", theme="rainbow")
+    )
+    assert result["success"] is False
+    assert "rainbow" in result["error"]
+
+
+def test_revealjs_config_options_resource():
+    """Verify the revealjs config resource lists supported options."""
+    config = json.loads(revealjs_config_options())
+    assert config["themes"] == list(REVEAL_THEMES)
+    assert config["transitions"] == list(REVEAL_TRANSITIONS)
+    assert config["transition_speeds"] == list(REVEAL_TRANSITION_SPEEDS)
+    assert "controls" in config["boolean_options"]
+    assert config["defaults"]["theme"] == "black"
+
+
 class _FakeCompletedProcess:
     def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
         self.returncode = returncode
@@ -142,6 +284,47 @@ def test_compile_presentation_failure(monkeypatch):
     result = json.loads(compile_presentation(scenes=["MissingSlide"], dest="out.html"))
     assert result["success"] is False
     assert "Slide not found" in result["error"]
+
+
+def test_export_revealjs_html_success(monkeypatch):
+    """Verify export_revealjs_html returns a successful structured response."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="Done"),
+    )
+    result = json.loads(export_revealjs_html(scenes=["MySlide"], dest="deck.html"))
+    assert result["success"] is True
+    assert result["format"] == "html"
+    assert result["scenes"] == ["MySlide"]
+    assert result["destination"].endswith("deck.html")
+
+
+def test_export_revealjs_html_failure(monkeypatch):
+    """Verify export_revealjs_html surfaces the converter error on failure."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(1, stderr="Slide not found"),
+    )
+    result = json.loads(
+        export_revealjs_html(scenes=["MissingSlide"], dest="deck.html")
+    )
+    assert result["success"] is False
+    assert "Slide not found" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_export_revealjs_html():
+    """Verify export_revealjs_html tool is registered on the MCPServer."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "export_revealjs_html" in tool_names
+
+    export_tool = next(t for t in tools if t.name == "export_revealjs_html")
+    assert "Reveal.js" in export_tool.description
+    assert "scenes" in export_tool.input_schema["properties"]
+    assert "theme" in export_tool.input_schema["properties"]
 
 
 @pytest.mark.anyio

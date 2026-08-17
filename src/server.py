@@ -34,6 +34,38 @@ def server_status() -> str:
     return f"Manim-Slides MCP Server is running (Python {python_version})"
 
 
+@mcp.resource("revealjs://config")
+def revealjs_config_options() -> str:
+    """Return the supported Reveal.js HTML export configuration options."""
+    return json.dumps(
+        {
+            "themes": list(REVEAL_THEMES),
+            "transitions": list(REVEAL_TRANSITIONS),
+            "transition_speeds": list(REVEAL_TRANSITION_SPEEDS),
+            "boolean_options": [
+                "controls",
+                "progress",
+                "slide_number",
+                "hash",
+                "loop",
+            ],
+            "defaults": {
+                "theme": "black",
+                "transition": "none",
+                "transition_speed": "default",
+                "controls": False,
+                "progress": False,
+                "slide_number": False,
+                "hash": False,
+                "loop": False,
+                "one_file": False,
+                "offline": False,
+            },
+        },
+        indent=2,
+    )
+
+
 @mcp.tool()
 def hello_world(name: str = "World") -> str:
     """A basic Hello World tool to verify client-server communication.
@@ -58,6 +90,15 @@ def _manim_slides_executable() -> list[str]:
     return [sys.executable, "-m", "manim_slides"]
 
 
+def _quote_js_string(val: str) -> str:
+    """Ensure a string option is quoted for Reveal.js Jinja template injection."""
+    if (val.startswith("'") and val.endswith("'")) or (
+        val.startswith('"') and val.endswith('"')
+    ):
+        return val
+    return f"'{val}'"
+
+
 def _build_convert_command(
     scenes: list[str],
     dest: str,
@@ -71,56 +112,156 @@ def _build_convert_command(
     command += ["--folder", folder, "--to", output_format]
     if one_file:
         command.append("--one-file")
+    is_html = output_format == "html" or (
+        output_format == "auto" and dest.endswith(".html")
+    )
     for key, value in (config or {}).items():
+        if is_html and key in {
+            "transition",
+            "transition_speed",
+            "navigation_mode",
+            "background_transition",
+        }:
+            value = _quote_js_string(value)
         command += ["-c", f"{key}={value}"]
     command += [*scenes, dest]
     return command
 
 
-@mcp.tool()
-def compile_presentation(
+REVEAL_THEMES = (
+    "black",
+    "white",
+    "league",
+    "beige",
+    "sky",
+    "night",
+    "serif",
+    "simple",
+    "solarized",
+    "blood",
+    "moon",
+    "dracula",
+)
+
+REVEAL_TRANSITIONS = ("none", "fade", "slide", "convex", "concave", "zoom")
+
+REVEAL_TRANSITION_SPEEDS = ("default", "fast", "slow")
+
+
+def _validate_reveal_options(
+    theme: str,
+    transition: str,
+    transition_speed: str,
+) -> str | None:
+    """Return an error message for invalid Reveal.js options, or None if valid."""
+    if theme not in REVEAL_THEMES:
+        return (
+            f"Invalid theme '{theme}'. "
+            f"Valid themes: {', '.join(REVEAL_THEMES)}."
+        )
+    if transition not in REVEAL_TRANSITIONS:
+        return (
+            f"Invalid transition '{transition}'. "
+            f"Valid transitions: {', '.join(REVEAL_TRANSITIONS)}."
+        )
+    if transition_speed not in REVEAL_TRANSITION_SPEEDS:
+        return (
+            f"Invalid transition_speed '{transition_speed}'. "
+            f"Valid speeds: {', '.join(REVEAL_TRANSITION_SPEEDS)}."
+        )
+    return None
+
+
+def _build_reveal_config(
+    theme: str = "black",
+    transition: str = "none",
+    transition_speed: str = "default",
+    controls: bool = False,
+    progress: bool = False,
+    slide_number: bool = False,
+    hash: bool = False,
+    loop: bool = False,
+    title: str | None = None,
+    config: dict[str, str] | None = None,
+) -> list[str]:
+    """Build ``-c key=value`` converter arguments for a Reveal.js HTML deck."""
+    values: dict[str, str] = {
+        "reveal_theme": theme,
+        "transition": _quote_js_string(transition),
+        "transition_speed": _quote_js_string(transition_speed),
+        "controls": str(controls).lower(),
+        "progress": str(progress).lower(),
+        "slide_number": str(slide_number).lower(),
+        "hash": str(hash).lower(),
+        "loop": str(loop).lower(),
+    }
+    if title:
+        values["title"] = title
+    for key, value in (config or {}).items():
+        if key in {
+            "transition",
+            "transition_speed",
+            "navigation_mode",
+            "background_transition",
+        }:
+            value = _quote_js_string(value)
+        values[key] = value
+    args: list[str] = []
+    for key, value in values.items():
+        args += ["-c", f"{key}={value}"]
+    return args
+
+
+def _build_revealjs_export_command(
     scenes: list[str],
     dest: str,
     folder: str = "slides",
-    output_format: str = "auto",
+    theme: str = "black",
+    transition: str = "none",
+    transition_speed: str = "default",
+    controls: bool = False,
+    progress: bool = False,
+    slide_number: bool = False,
+    hash: bool = False,
+    loop: bool = False,
+    title: str | None = None,
     config: dict[str, str] | None = None,
     one_file: bool = False,
-    workspace_dir: str | None = None,
-    timeout: int = 300,
+    offline: bool = False,
+) -> list[str]:
+    """Build the argument list for a Reveal.js HTML export via convert."""
+    command = [*_manim_slides_executable(), "convert"]
+    command += ["--folder", folder, "--to", "html"]
+    if one_file:
+        command.append("--one-file")
+    if offline:
+        command.append("--offline")
+    command += _build_reveal_config(
+        theme=theme,
+        transition=transition,
+        transition_speed=transition_speed,
+        controls=controls,
+        progress=progress,
+        slide_number=slide_number,
+        hash=hash,
+        loop=loop,
+        title=title,
+        config=config,
+    )
+    command += [*scenes, dest]
+    return command
+
+
+def _run_convert(
+    command: list[str],
+    dest: str,
+    scenes: list[str],
+    output_format: str,
+    cwd: str | None,
+    timeout: int,
 ) -> str:
-    """Compile rendered Manim-Slides scenes using ``manim-slides convert``.
-
-    Wraps ``manim-slides convert`` to turn rendered slide assets into an
-    interactive presentation (e.g., Reveal.js HTML, PDF, or PPTX).
-
-    Args:
-        scenes: Names of the rendered Scene/Slide classes to include, in order.
-        dest: Destination path for the compiled presentation
-            (e.g., "presentation.html"). The format is inferred from the
-            extension when ``output_format`` is "auto".
-        folder: Directory containing the rendered slide assets (default "slides").
-        output_format: Conversion format: "auto", "html", "pdf", "pptx", or "zip".
-        config: Extra converter options as key/value pairs
-            (e.g., {"slide_number": "true"}).
-        one_file: Embed all local assets (e.g., videos) into a single output file.
-        workspace_dir: Working directory for the conversion. Defaults to the
-            ``WORKSPACE_DIR`` environment variable or the current directory.
-        timeout: Maximum time in seconds to wait for the conversion.
-
-    Returns:
-        A JSON string with the conversion status, output destination,
-        executed command, and captured stdout/stderr.
-    """
+    """Run a ``manim-slides convert`` command and return a structured JSON result."""
     try:
-        cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
-        command = _build_convert_command(
-            scenes=scenes,
-            dest=dest,
-            folder=folder,
-            output_format=output_format,
-            config=config,
-            one_file=one_file,
-        )
         result = subprocess.run(
             command,
             capture_output=True,
@@ -159,9 +300,133 @@ def compile_presentation(
         return json.dumps(
             {
                 "success": False,
-                "error": f"Error executing compile_presentation tool: {e}",
+                "error": f"Error executing convert tool: {e}",
             }
         )
+
+
+@mcp.tool()
+def compile_presentation(
+    scenes: list[str],
+    dest: str,
+    folder: str = "slides",
+    output_format: str = "auto",
+    config: dict[str, str] | None = None,
+    one_file: bool = False,
+    workspace_dir: str | None = None,
+    timeout: int = 300,
+) -> str:
+    """Compile rendered Manim-Slides scenes using ``manim-slides convert``.
+
+    Wraps ``manim-slides convert`` to turn rendered slide assets into an
+    interactive presentation (e.g., Reveal.js HTML, PDF, or PPTX).
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in order.
+        dest: Destination path for the compiled presentation
+            (e.g., "presentation.html"). The format is inferred from the
+            extension when ``output_format`` is "auto".
+        folder: Directory containing the rendered slide assets (default "slides").
+        output_format: Conversion format: "auto", "html", "pdf", "pptx", or "zip".
+        config: Extra converter options as key/value pairs
+            (e.g., {"slide_number": "true"}).
+        one_file: Embed all local assets (e.g., videos) into a single output file.
+        workspace_dir: Working directory for the conversion. Defaults to the
+            ``WORKSPACE_DIR`` environment variable or the current directory.
+        timeout: Maximum time in seconds to wait for the conversion.
+
+    Returns:
+        A JSON string with the conversion status, output destination,
+        executed command, and captured stdout/stderr.
+    """
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    command = _build_convert_command(
+        scenes=scenes,
+        dest=dest,
+        folder=folder,
+        output_format=output_format,
+        config=config,
+        one_file=one_file,
+    )
+    return _run_convert(command, dest, scenes, output_format, cwd, timeout)
+
+
+@mcp.tool()
+def export_revealjs_html(
+    scenes: list[str],
+    dest: str,
+    folder: str = "slides",
+    theme: str = "black",
+    transition: str = "none",
+    transition_speed: str = "default",
+    controls: bool = False,
+    progress: bool = False,
+    slide_number: bool = False,
+    hash: bool = False,
+    loop: bool = False,
+    title: str | None = None,
+    config: dict[str, str] | None = None,
+    one_file: bool = False,
+    offline: bool = False,
+    workspace_dir: str | None = None,
+    timeout: int = 300,
+) -> str:
+    """Export rendered Manim-Slides scenes to an interactive Reveal.js HTML deck.
+
+    Wraps ``manim-slides convert --to html`` with first-class Reveal.js
+    configuration for themes, transitions, and navigation controls.
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in order.
+        dest: Destination path for the exported HTML deck
+            (e.g., "presentation.html").
+        folder: Directory containing the rendered slide assets (default "slides").
+        theme: Reveal.js theme: "black", "white", "league", "beige", "sky",
+            "night", "serif", "simple", "solarized", "blood", "moon", or
+            "dracula". Defaults to "black".
+        transition: Slide transition: "none", "fade", "slide", "convex",
+            "concave", or "zoom". Defaults to "none".
+        transition_speed: Transition speed: "default", "fast", or "slow".
+        controls: Show navigation control arrows in the corner.
+        progress: Show a presentation progress bar.
+        slide_number: Display the current slide number.
+        hash: Add the current slide to the URL hash for deep linking.
+        loop: Loop the presentation.
+        title: Presentation title used in the browser tab.
+        config: Extra Reveal.js converter options as key/value pairs
+            (e.g., {"background_color": "white"}).
+        one_file: Embed all local assets (e.g., videos) into a single HTML file.
+        offline: Download remote Reveal.js assets for offline viewing.
+        workspace_dir: Working directory for the conversion. Defaults to the
+            ``WORKSPACE_DIR`` environment variable or the current directory.
+        timeout: Maximum time in seconds to wait for the conversion.
+
+    Returns:
+        A JSON string with the export status, output destination,
+        executed command, and captured stdout/stderr.
+    """
+    error = _validate_reveal_options(theme, transition, transition_speed)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    command = _build_revealjs_export_command(
+        scenes=scenes,
+        dest=dest,
+        folder=folder,
+        theme=theme,
+        transition=transition,
+        transition_speed=transition_speed,
+        controls=controls,
+        progress=progress,
+        slide_number=slide_number,
+        hash=hash,
+        loop=loop,
+        title=title,
+        config=config,
+        one_file=one_file,
+        offline=offline,
+    )
+    return _run_convert(command, dest, scenes, "html", cwd, timeout)
 
 
 MEDIA_EXTENSIONS = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg"}
