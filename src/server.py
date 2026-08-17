@@ -429,6 +429,270 @@ def export_revealjs_html(
     return _run_convert(command, dest, scenes, "html", cwd, timeout)
 
 
+PREVIEW_IMAGE_FORMATS = {"png", "jpg", "jpeg", "webp"}
+PREVIEW_VIDEO_FORMATS = {"mp4", "gif"}
+
+GIF_FILTER = (
+    "fps=15,scale=640:-1:flags=lanczos,"
+    "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+)
+
+
+def _ffmpeg_executable() -> str | None:
+    """Return the path to the ffmpeg executable, or None if unavailable."""
+    return shutil.which("ffmpeg")
+
+
+def _load_scene_config(folder_path: Path, scene: str) -> dict | None:
+    """Load a rendered scene's slide configuration from ``folder_path``."""
+    config_path = folder_path / f"{scene}.json"
+    if not config_path.is_file():
+        return None
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _resolve_slide_media(cwd: str | None, slide: dict) -> Path | None:
+    """Resolve the media file for a slide relative to the workspace root."""
+    file = slide.get("file")
+    if not file:
+        return None
+    return Path(cwd or ".").joinpath(file).resolve()
+
+
+@mcp.tool()
+def list_scenes(folder: str = "slides", workspace_dir: str | None = None) -> str:
+    """Discover rendered scenes and their slide metadata in the workspace.
+
+    Reads the slide configuration files (``<scene>.json``) produced by
+    ``manim-slides render`` and returns structured metadata for each scene,
+    including slide counts, resolution, and per-slide media files.
+
+    Args:
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+
+    Returns:
+        A JSON string listing the discovered scenes and their slide metadata.
+    """
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+    if not folder_path.is_dir():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Slides folder not found: {folder_path}",
+            }
+        )
+    scenes = []
+    for json_file in sorted(folder_path.glob("*.json")):
+        data = _load_scene_config(folder_path, json_file.stem)
+        if data is None:
+            continue
+        slides = data.get("slides", [])
+        scenes.append(
+            {
+                "scene": json_file.stem,
+                "slide_count": len(slides),
+                "resolution": data.get("resolution"),
+                "background_color": data.get("background_color"),
+                "slides": [
+                    {
+                        "index": index,
+                        "type": slide.get("type"),
+                        "file": slide.get("file"),
+                    }
+                    for index, slide in enumerate(slides)
+                ],
+            }
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "folder": str(folder_path.resolve()),
+            "scene_count": len(scenes),
+            "scenes": scenes,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def preview_slide(
+    scene: str,
+    slide_index: int = 0,
+    output_format: str = "png",
+    folder: str = "slides",
+    workspace_dir: str | None = None,
+    timeout: int = 120,
+) -> str:
+    """Extract a single-slide preview (image or video) without compiling the deck.
+
+    Reads the rendered slide configuration for ``scene`` and produces a preview
+    of the slide at ``slide_index``: an image frame (png/jpg/webp), a video
+    snippet (mp4), or an animated GIF.
+
+    Args:
+        scene: Name of the rendered Scene/Slide class to preview.
+        slide_index: Zero-based index of the slide within the scene.
+        output_format: Preview format: "png", "jpg", "jpeg", "webp", "mp4",
+            or "gif". Defaults to "png".
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        timeout: Maximum time in seconds to wait for ffmpeg preview generation.
+
+    Returns:
+        A JSON string with the preview status, output path, and format.
+    """
+    output_format = output_format.lower()
+    supported = sorted(PREVIEW_IMAGE_FORMATS | PREVIEW_VIDEO_FORMATS)
+    if output_format not in PREVIEW_IMAGE_FORMATS | PREVIEW_VIDEO_FORMATS:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Unsupported output_format '{output_format}'. "
+                    f"Valid formats: {', '.join(supported)}."
+                ),
+            }
+        )
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+    data = _load_scene_config(folder_path, scene)
+    if data is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Scene '{scene}' not found in {folder_path}.",
+            }
+        )
+    slides = data.get("slides", [])
+    if not 0 <= slide_index < len(slides):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Slide index {slide_index} out of range "
+                    f"(scene '{scene}' has {len(slides)} slides)."
+                ),
+            }
+        )
+    slide = slides[slide_index]
+    media = _resolve_slide_media(cwd, slide)
+    if media is None or not media.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Slide media file not found: {slide.get('file')}",
+            }
+        )
+    slide_type = slide.get("type")
+    if slide_type == "image" and output_format in PREVIEW_VIDEO_FORMATS:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Cannot preview image slide as '{output_format}'. "
+                    "Use an image format (png/jpg/webp) instead."
+                ),
+            }
+        )
+
+    preview_dir = Path(cwd or ".").joinpath("preview")
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    destination = preview_dir / f"{scene}_{slide_index}.{output_format}"
+
+    command: list[str] | None = None
+    if slide_type == "image":
+        matches = media.suffix.lower() == f".{output_format}" or (
+            output_format == "jpeg" and media.suffix.lower() == ".jpg"
+        )
+        if not matches:
+            command = ["ffmpeg", "-y", "-i", str(media), str(destination)]
+    elif output_format == "mp4":
+        pass
+    elif output_format == "gif":
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(media),
+            "-vf",
+            GIF_FILTER,
+            str(destination),
+        ]
+    else:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(media),
+            "-vf",
+            "thumbnail",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(destination),
+        ]
+
+    if command is not None:
+        ffmpeg = _ffmpeg_executable()
+        if ffmpeg is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "ffmpeg executable not found. "
+                        "Install FFmpeg to generate previews."
+                    ),
+                }
+            )
+        command[0] = ffmpeg
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Preview generation timed out after {timeout}s: {e}",
+                }
+            )
+        if result.returncode != 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        result.stderr.strip()
+                        or "Unknown preview generation error."
+                    ),
+                }
+            )
+    else:
+        shutil.copyfile(media, destination)
+
+    return json.dumps(
+        {
+            "success": True,
+            "scene": scene,
+            "slide_index": slide_index,
+            "slide_type": slide_type,
+            "output_format": output_format,
+            "preview_path": str(destination.resolve()),
+        },
+        indent=2,
+    )
+
+
 MEDIA_EXTENSIONS = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg"}
 
 

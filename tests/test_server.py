@@ -20,7 +20,9 @@ from src.server import (
     execute_manim_code,
     export_revealjs_html,
     hello_world,
+    list_scenes,
     mcp,
+    preview_slide,
     revealjs_config_options,
     server_status,
 )
@@ -437,3 +439,145 @@ async def test_server_list_tools_includes_execute_manim_code():
     assert "manim-slides render" in exec_tool.description
     assert "code" in exec_tool.input_schema["properties"]
     assert "scenes" in exec_tool.input_schema["properties"]
+
+
+def _write_scene_config(tmp_path: Path, scene: str, slides: list[dict]) -> Path:
+    """Create a fake slides folder with a scene config and media files."""
+    slides_dir = tmp_path / "slides"
+    slides_dir.mkdir(exist_ok=True)
+    for slide in slides:
+        file = slide["file"]
+        media_path = tmp_path / file
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_text("fake")
+    (slides_dir / f"{scene}.json").write_text(
+        json.dumps(
+            {
+                "slides": slides,
+                "resolution": [854, 480],
+                "background_color": "black",
+            }
+        )
+    )
+    return slides_dir
+
+
+def test_list_scenes_success(tmp_path):
+    """Verify list_scenes discovers scenes and their slide metadata."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [
+            {"type": "video", "file": "slides/files/MySlide/0.mp4"},
+            {"type": "video", "file": "slides/files/MySlide/1.mp4"},
+        ],
+    )
+    result = json.loads(list_scenes(workspace_dir=str(tmp_path)))
+    assert result["success"] is True
+    assert result["scene_count"] == 1
+    assert result["scenes"][0]["scene"] == "MySlide"
+    assert result["scenes"][0]["slide_count"] == 2
+    assert result["scenes"][0]["resolution"] == [854, 480]
+    assert result["scenes"][0]["slides"][0]["type"] == "video"
+
+
+def test_list_scenes_missing_folder(tmp_path):
+    """Verify list_scenes reports an error when the folder is absent."""
+    result = json.loads(list_scenes(workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_preview_slide_video_to_png(monkeypatch, tmp_path):
+    """Verify preview_slide extracts a PNG frame from a video slide."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+
+    def fake_run(command, **kwargs):
+        destination = Path(command[-1])
+        destination.write_text("fake-png")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("src.server._ffmpeg_executable", lambda: "/usr/bin/ffmpeg")
+
+    result = json.loads(
+        preview_slide(scene="MySlide", workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is True
+    assert result["scene"] == "MySlide"
+    assert result["slide_index"] == 0
+    assert result["output_format"] == "png"
+    assert result["preview_path"].endswith("MySlide_0.png")
+
+
+def test_preview_slide_video_to_mp4_copy(monkeypatch, tmp_path):
+    """Verify preview_slide copies the slide video for mp4 output."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+    result = json.loads(
+        preview_slide(
+            scene="MySlide",
+            slide_index=0,
+            output_format="mp4",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is True
+    assert result["preview_path"].endswith("MySlide_0.mp4")
+
+
+def test_preview_slide_out_of_range(tmp_path):
+    """Verify preview_slide reports an error for an invalid slide index."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+    result = json.loads(
+        preview_slide(scene="MySlide", slide_index=5, workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "out of range" in result["error"]
+
+
+def test_preview_slide_missing_scene(tmp_path):
+    """Verify preview_slide reports an error when the scene is not found."""
+    result = json.loads(
+        preview_slide(scene="Nope", workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_preview_slide_unsupported_format(tmp_path):
+    """Verify preview_slide rejects unsupported output formats."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+    result = json.loads(
+        preview_slide(scene="MySlide", output_format="pdf", workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "Unsupported output_format" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_preview_and_list_scenes():
+    """Verify list_scenes and preview_slide tools are registered."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "list_scenes" in tool_names
+    assert "preview_slide" in tool_names
+
+    preview_tool = next(t for t in tools if t.name == "preview_slide")
+    assert "scene" in preview_tool.input_schema["properties"]
+    assert "output_format" in preview_tool.input_schema["properties"]

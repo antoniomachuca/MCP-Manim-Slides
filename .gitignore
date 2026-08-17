@@ -47,6 +47,7 @@ manim.cfg
 
 # Manim Slides specific
 slides/
+preview/
 *.html
 *.mp4
 
