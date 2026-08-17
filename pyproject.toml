@@ -24,6 +24,9 @@ dev = [
     "ruff>=0.5.0",
 ]
 
+[project.scripts]
+mcp-manim-slides = "src.server:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 

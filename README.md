@@ -28,8 +28,8 @@ Ensure your system has the following installed:
 ## Installation
 
 ```bash
-git clone https://github.com/antoniomachuca/MCP-Manim-Slides
-cd mcp-manim-slides
+git clone https://github.com/antoniomachuca/MCP-Manim-Slides.git
+cd MCP-Manim-Slides
 
 # Create a virtual environment
 python -m venv .venv
@@ -37,19 +37,21 @@ source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+# or install in editable mode:
+pip install -e .
 ```
 
 ## Configuration
 
-To integrate this server with an MCP-compatible client (e.g., Claude Desktop), add the following to your client configuration JSON:
+To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cursor, Antigravity), add the following to your client configuration JSON:
 
 ```json
 {
   "mcpServers": {
-    "manim-slides-server": {
-      "command": "/absolute/path/to/mcp-manim-slides/.venv/bin/python",
+    "manim-slides": {
+      "command": "/absolute/path/to/MCP-Manim-Slides/.venv/bin/python",
       "args": [
-        "/absolute/path/to/mcp-manim-slides/src/server.py"
+        "/absolute/path/to/MCP-Manim-Slides/src/server.py"
       ],
       "env": {
         "WORKSPACE_DIR": "/path/to/your/output/directory"
@@ -59,11 +61,39 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop), a
 }
 ```
 
-## Available MCP Tools
+## Available MCP Tools & Resources
 
-- `render_slide(code: str, slide_name: str)`: Executes the provided Manim code and renders the specific slide.
-- `compile_presentation(slide_name: str, format: str)`: Compiles the generated slide assets into the specified format (e.g., `html`).
-- `get_presentation_status()`: Retrieves the status of the current working directory and existing slide assets.
+### Tools (`@mcp.tool`)
+- `hello_world(name: str = "World")`: Connectivity check tool to verify client-server MCP communication.
+- `execute_manim_code(code: str, scenes: list[str] | None = None, quality: str = "l", media_dir: str | None = None, timeout: int = 600)`: Writes the provided Manim code to a secure temporary script, renders the scenes headlessly via `manim-slides render`, and returns paths to produced media files.
+- `compile_presentation(scenes: list[str], dest: str, folder: str = "slides", output_format: str = "auto", config: dict[str, str] | None = None, one_file: bool = False, workspace_dir: str | None = None, timeout: int = 300)`: Compiles rendered slide assets into an interactive presentation via `manim-slides convert` (supports `html`/Reveal.js, `pdf`, `pptx`, `zip`, custom Reveal.js themes and transition configs).
+- `preview_slide(scene: str, slide_index: int = 0, output_format: str = "png", folder: str = "slides", workspace_dir: str | None = None)`: Extracts a single slide preview (image or video snippet) for rapid visual validation without compiling the full presentation.
+- `list_scenes(folder: str = "slides", workspace_dir: str | None = None)`: Discovers and lists all rendered scenes, slide counts, and metadata available in the workspace.
+
+### Resources (`@mcp.resource`)
+- `status://server`: Telemetry resource returning current server status, Python version, and environment details.
+- `slides://list`: Resource listing all rendered slide configurations and metadata in the active workspace.
+
+## Example Slide Code
+
+```python
+from manim import *
+from manim_slides import Slide
+
+class IntroPresentation(Slide):
+    def construct(self):
+        title = Text("Interactive Presentation", font_size=48, color=BLUE)
+        self.play(Write(title))
+        self.next_slide()  # Slide transition pause
+
+        subtitle = Text("Powered by Manim & MCP", font_size=32).next_to(title, DOWN)
+        self.play(FadeIn(subtitle))
+        self.next_slide()
+
+        self.play(FadeOut(title), FadeOut(subtitle))
+        circle = Circle(radius=2, color=GREEN)
+        self.play(Create(circle))
+```
 
 ## License
 
