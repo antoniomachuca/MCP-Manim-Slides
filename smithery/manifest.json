@@ -16,7 +16,7 @@
   "homepage": "https://github.com/antoniomachuca/MCP-Manim-Slides",
   "support": "https://github.com/antoniomachuca/MCP-Manim-Slides/issues",
   "server": {
-    "type": "uv",
+    "type": "python",
     "entry_point": "mcp_manim_slides/server.py",
     "mcp_config": {
       "command": "uv",
