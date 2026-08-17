@@ -23,12 +23,12 @@ Ensure your system has the following installed:
 
 - Python 3.10+
 - [Manim Community Edition](https://docs.manim.community/en/stable/installation.html) (Requires FFmpeg and LaTeX)
-- [Manim-Slides](https://manim-slides.eertmans.be/latest/installation/)
+- [Manim-Slides](https://manim-slides.eertmans.be/latest/installation.html)
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/mcp-manim-slides.git
+git clone https://github.com/antoniomachuca/MCP-Manim-Slides
 cd mcp-manim-slides
 
 # Create a virtual environment
