@@ -10,6 +10,10 @@ While traditional AI coding assistants can write Manim code, executing that code
 2. **Handle Slides Orchestration**: Natively support the `Slide` class for presentation logic.
 3. **Compile Presentations**: Convert rendered animations into interactive HTML presentations (Reveal.js) directly from the AI prompt.
 
+## Demo
+
+![Manim-Slides MCP Demo](assets/demo.gif)
+
 ## Features
 
 - **Direct Code Execution**: Send Python code containing Manim `Slide` classes; the server handles temporary file creation, execution, and cleanup.
@@ -77,28 +81,6 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
 - `status://server`: Telemetry resource returning current server status, Python version, and environment details.
 - `revealjs://config`: Lists supported Reveal.js HTML export options (themes, transitions, transition speeds, boolean toggles, and defaults).
 - `slides://list`: Resource listing all rendered slide configurations and metadata in the active workspace.
-
-## Example Slide Code
-
-```python
-from manim import *
-from manim_slides import Slide
-
-
-class IntroPresentation(Slide):
-    def construct(self):
-        title = Text("Interactive Presentation", font_size=48, color=BLUE)
-        self.play(Write(title))
-        self.next_slide()  # Slide transition pause
-
-        subtitle = Text("Powered by Manim & MCP", font_size=32).next_to(title, DOWN)
-        self.play(FadeIn(subtitle))
-        self.next_slide()
-
-        self.play(FadeOut(title), FadeOut(subtitle))
-        circle = Circle(radius=2, color=GREEN)
-        self.play(Create(circle))
-```
 
 ## License
 
