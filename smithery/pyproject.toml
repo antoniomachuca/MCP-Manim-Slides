@@ -1,0 +1,10 @@
+[project]
+name = "mcp-manim-slides"
+version = "0.1.0"
+description = "Model Context Protocol (MCP) server for Manim-Slides presentations"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=2.0.0",
+    "manim>=0.18.1",
+    "manim-slides>=5.2.0",
+]

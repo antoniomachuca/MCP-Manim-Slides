@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.4",
+  "name": "manim-slides",
+  "display_name": "Manim-Slides MCP Server",
+  "version": "0.1.0",
+  "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting",
+  "author": {
+    "name": "Antonio Machuca",
+    "url": "https://github.com/antoniomachuca"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antoniomachuca/MCP-Manim-Slides.git"
+  },
+  "homepage": "https://github.com/antoniomachuca/MCP-Manim-Slides",
+  "support": "https://github.com/antoniomachuca/MCP-Manim-Slides/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "mcp_manim_slides/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "mcp_manim_slides/server.py"],
+      "env": {
+        "WORKSPACE_DIR": "${user_config.workspace_dir}"
+      }
+    }
+  },
+  "user_config": {
+    "workspace_dir": {
+      "type": "directory",
+      "title": "Workspace Directory",
+      "description": "Directory where rendered slides, media, and exported presentations are stored.",
+      "required": false,
+      "default": "${HOME}/manim-slides-workspace"
+    }
+  },
+  "tools": [
+    { "name": "hello_world", "description": "Connectivity check to verify client-server MCP communication." },
+    { "name": "execute_manim_code", "description": "Write, render, and run Manim Slide code headlessly, returning produced media paths." },
+    { "name": "compile_presentation", "description": "Compile rendered slide assets into an interactive presentation (HTML, PDF, PPTX, ZIP)." },
+    { "name": "export_revealjs_html", "description": "Export rendered scenes to an interactive Reveal.js HTML deck with theme and transition options." },
+    { "name": "preview_slide", "description": "Extract a single slide preview as an image, video snippet, or animated GIF." },
+    { "name": "list_scenes", "description": "Discover and list all rendered scenes, slide counts, and metadata in the workspace." },
+    { "name": "serve_revealjs_html", "description": "Serve an exported Reveal.js deck on a local HTTP server for browser preview." },
+    { "name": "stop_preview_server", "description": "Stop a running ephemeral preview server." }
+  ],
+  "tools_generated": false,
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "keywords": ["manim", "slides", "presentation", "animation", "revealjs", "latex", "education"],
+  "license": "MIT"
+}
