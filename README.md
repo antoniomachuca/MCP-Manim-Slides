@@ -84,6 +84,7 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
 from manim import *
 from manim_slides import Slide
 
+
 class IntroPresentation(Slide):
     def construct(self):
         title = Text("Interactive Presentation", font_size=48, color=BLUE)
