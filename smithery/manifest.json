@@ -36,14 +36,129 @@
     }
   },
   "tools": [
-    { "name": "hello_world", "description": "Connectivity check to verify client-server MCP communication." },
-    { "name": "execute_manim_code", "description": "Write, render, and run Manim Slide code headlessly, returning produced media paths." },
-    { "name": "compile_presentation", "description": "Compile rendered slide assets into an interactive presentation (HTML, PDF, PPTX, ZIP)." },
-    { "name": "export_revealjs_html", "description": "Export rendered scenes to an interactive Reveal.js HTML deck with theme and transition options." },
-    { "name": "preview_slide", "description": "Extract a single slide preview as an image, video snippet, or animated GIF." },
-    { "name": "list_scenes", "description": "Discover and list all rendered scenes, slide counts, and metadata in the workspace." },
-    { "name": "serve_revealjs_html", "description": "Serve an exported Reveal.js deck on a local HTTP server for browser preview." },
-    { "name": "stop_preview_server", "description": "Stop a running ephemeral preview server." }
+    {
+      "name": "hello_world",
+      "description": "Connectivity check to verify client-server MCP communication.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Name to greet.", "default": "World" }
+        }
+      }
+    },
+    {
+      "name": "execute_manim_code",
+      "description": "Write, render, and run Manim Slide code headlessly, returning produced media paths.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "description": "Python source code defining one or more Manim Scene/Slide classes." },
+          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the Scene/Slide classes to render." },
+          "quality": { "type": "string", "enum": ["l", "m", "h", "p", "k"], "default": "l", "description": "Render quality." },
+          "media_dir": { "type": "string", "description": "Directory where rendered media is stored." },
+          "timeout": { "type": "integer", "default": 600, "description": "Maximum render time in seconds." },
+          "use_cache": { "type": "boolean", "default": true, "description": "Reuse previously rendered media for unchanged requests." }
+        },
+        "required": ["code"]
+      }
+    },
+    {
+      "name": "compile_presentation",
+      "description": "Compile rendered slide assets into an interactive presentation (HTML, PDF, PPTX, ZIP).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the rendered scenes to include, in order." },
+          "dest": { "type": "string", "description": "Destination path for the compiled presentation." },
+          "folder": { "type": "string", "default": "slides" },
+          "output_format": { "type": "string", "enum": ["auto", "html", "pdf", "pptx", "zip"], "default": "auto" },
+          "config": { "type": "object", "additionalProperties": { "type": "string" } },
+          "one_file": { "type": "boolean", "default": false },
+          "workspace_dir": { "type": "string" },
+          "timeout": { "type": "integer", "default": 300 }
+        },
+        "required": ["scenes", "dest"]
+      }
+    },
+    {
+      "name": "export_revealjs_html",
+      "description": "Export rendered scenes to an interactive Reveal.js HTML deck with theme and transition options.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the rendered scenes to include, in order." },
+          "dest": { "type": "string", "description": "Destination path for the exported HTML deck." },
+          "folder": { "type": "string", "default": "slides" },
+          "theme": { "type": "string", "default": "black" },
+          "transition": { "type": "string", "default": "none" },
+          "transition_speed": { "type": "string", "default": "default" },
+          "controls": { "type": "boolean", "default": false },
+          "progress": { "type": "boolean", "default": false },
+          "slide_number": { "type": "boolean", "default": false },
+          "hash": { "type": "boolean", "default": false },
+          "loop": { "type": "boolean", "default": false },
+          "title": { "type": "string" },
+          "config": { "type": "object", "additionalProperties": { "type": "string" } },
+          "one_file": { "type": "boolean", "default": false },
+          "offline": { "type": "boolean", "default": false },
+          "workspace_dir": { "type": "string" },
+          "timeout": { "type": "integer", "default": 300 }
+        },
+        "required": ["scenes", "dest"]
+      }
+    },
+    {
+      "name": "preview_slide",
+      "description": "Extract a single slide preview as an image, video snippet, or animated GIF.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scene": { "type": "string", "description": "Name of the rendered Scene/Slide class to preview." },
+          "slide_index": { "type": "integer", "default": 0 },
+          "output_format": { "type": "string", "enum": ["png", "jpg", "jpeg", "webp", "mp4", "gif"], "default": "png" },
+          "folder": { "type": "string", "default": "slides" },
+          "workspace_dir": { "type": "string" },
+          "timeout": { "type": "integer", "default": 120 }
+        },
+        "required": ["scene"]
+      }
+    },
+    {
+      "name": "list_scenes",
+      "description": "Discover and list all rendered scenes, slide counts, and metadata in the workspace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "folder": { "type": "string", "default": "slides" },
+          "workspace_dir": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "serve_revealjs_html",
+      "description": "Serve an exported Reveal.js deck on a local HTTP server for browser preview.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dest": { "type": "string", "description": "Path to the exported HTML deck." },
+          "workspace_dir": { "type": "string" },
+          "host": { "type": "string", "default": "127.0.0.1" },
+          "port": { "type": "integer" },
+          "open_browser": { "type": "boolean", "default": true }
+        },
+        "required": ["dest"]
+      }
+    },
+    {
+      "name": "stop_preview_server",
+      "description": "Stop a running ephemeral preview server.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "port": { "type": "integer", "description": "Port of the server to stop. When omitted, all preview servers are stopped." }
+        }
+      }
+    }
   ],
   "tools_generated": false,
   "compatibility": {
