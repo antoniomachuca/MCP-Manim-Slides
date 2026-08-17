@@ -17,6 +17,7 @@ While traditional AI coding assistants can write Manim code, executing that code
 - **Live Render Progress**: Streams rendered-frame percentage updates to the client via `notifications/progress`.
 - **Render Caching**: Content-hashes each render request (code + scenes + quality) to skip re-rendering unchanged slides, reusing previously rendered media from `.render_cache`.
 - **HTML/Reveal.js Export**: Seamlessly compiles the generated video assets into a fully functional interactive web presentation.
+- **One-Click Browser Preview**: Serves the exported Reveal.js HTML on an ephemeral local HTTP server so it can be opened in a browser with a single call.
 - **State Management**: Persists generated media in structured workspace directories for easy access.
 
 ## Prerequisites
@@ -69,6 +70,8 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
 - `export_revealjs_html(scenes: list[str], dest: str, folder: str = "slides", theme: str = "black", transition: str = "none", transition_speed: str = "default", controls: bool = False, progress: bool = False, slide_number: bool = False, hash: bool = False, loop: bool = False, title: str | None = None, config: dict[str, str] | None = None, one_file: bool = False, offline: bool = False, workspace_dir: str | None = None, timeout: int = 300)`: First-class Reveal.js HTML export via `manim-slides convert --to html`, with typed configuration for themes, transitions, navigation controls, slide numbers, deep linking, looping, and offline/one-file embedding.
 - `preview_slide(scene: str, slide_index: int = 0, output_format: str = "png", folder: str = "slides", workspace_dir: str | None = None, timeout: int = 120)`: Extracts a single slide preview (image frame `png`/`jpg`/`webp`, video snippet `mp4`, or animated `gif`) via FFmpeg for rapid visual validation without compiling the full presentation.
 - `list_scenes(folder: str = "slides", workspace_dir: str | None = None)`: Discovers and lists all rendered scenes, slide counts, and metadata available in the workspace.
+- `serve_revealjs_html(dest: str, workspace_dir: str | None = None, host: str = "127.0.0.1", port: int | None = None, open_browser: bool = True)`: Serves an exported Reveal.js HTML deck on an ephemeral local HTTP server for one-click browser preview. Returns the preview URL and optionally opens it in the default browser.
+- `stop_preview_server(port: int | None = None)`: Stops a running ephemeral preview server by port, or all preview servers when no port is given.
 
 ### Resources (`@mcp.resource`)
 - `status://server`: Telemetry resource returning current server status, Python version, and environment details.

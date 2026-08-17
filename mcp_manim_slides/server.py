@@ -15,10 +15,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import webbrowser
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -429,6 +433,177 @@ def export_revealjs_html(
         offline=offline,
     )
     return _run_convert(command, dest, scenes, "html", cwd, timeout)
+
+
+_PREVIEW_SERVERS: dict[str, ThreadingHTTPServer] = {}
+_PREVIEW_SERVERS_LOCK = threading.Lock()
+
+
+def _preview_server_key(directory: Path) -> str:
+    """Return the registry key for a served directory."""
+    return str(directory.resolve())
+
+
+def _start_preview_server(
+    directory: Path,
+    host: str,
+    port: int | None,
+) -> tuple[ThreadingHTTPServer, int, bool]:
+    """Start a background HTTP server for ``directory``, or reuse an existing one.
+
+    The server runs in a daemon thread for the lifetime of the MCP process.
+    When ``port`` is None, an ephemeral OS-assigned port is used. Returns the
+    server instance, the bound port, and whether an existing server was reused.
+    """
+    key = _preview_server_key(directory)
+    with _PREVIEW_SERVERS_LOCK:
+        existing = _PREVIEW_SERVERS.get(key)
+        if existing is not None:
+            return existing, existing.server_address[1], True
+        handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
+        server = ThreadingHTTPServer((host, port or 0), handler)
+        server.daemon_threads = True
+        _PREVIEW_SERVERS[key] = server
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_address[1], False
+
+
+@mcp.tool()
+def serve_revealjs_html(
+    dest: str,
+    workspace_dir: str | None = None,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    open_browser: bool = True,
+) -> str:
+    """Serve an exported Reveal.js HTML deck on a local HTTP server for preview.
+
+    Starts an ephemeral background HTTP server that serves the workspace so the
+    deck's relative slide assets resolve, and returns a URL that can be opened
+    in a browser (optionally opening it automatically).
+
+    Args:
+        dest: Path to the exported HTML deck (e.g., "presentation.html"). Resolved
+            relative to ``workspace_dir`` when not absolute.
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        host: Bind address for the server (default "127.0.0.1").
+        port: Port to bind. When None, an ephemeral OS-assigned port is used.
+        open_browser: When True, attempt to open the URL in the default browser.
+
+    Returns:
+        A JSON string with the preview URL, bound port, served directory, and
+        whether an existing server was reused.
+    """
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR") or "."
+    workspace = Path(cwd).resolve()
+    dest_path = Path(dest)
+    if not dest_path.is_absolute():
+        dest_path = (workspace / dest_path).resolve()
+
+    if not dest_path.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"HTML deck not found: {dest_path}",
+            }
+        )
+    if dest_path.suffix.lower() != ".html":
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Expected an .html file, got: {dest_path}",
+            }
+        )
+
+    try:
+        url_path = dest_path.relative_to(workspace).as_posix()
+        serve_dir = workspace
+    except ValueError:
+        url_path = dest_path.name
+        serve_dir = dest_path.parent
+
+    try:
+        server, bound_port, reused = _start_preview_server(serve_dir, host, port)
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to start preview server: {e}",
+            }
+        )
+
+    url = f"http://{host}:{bound_port}/{url_path}"
+
+    browser_opened = False
+    if open_browser:
+        try:
+            browser_opened = bool(webbrowser.open(url))
+        except Exception:
+            browser_opened = False
+
+    return json.dumps(
+        {
+            "success": True,
+            "url": url,
+            "host": host,
+            "port": bound_port,
+            "directory": str(serve_dir.resolve()),
+            "file": url_path,
+            "reused": reused,
+            "browser_opened": browser_opened,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def stop_preview_server(port: int | None = None) -> str:
+    """Stop running ephemeral preview servers started by ``serve_revealjs_html``.
+
+    Args:
+        port: Port of the server to stop. When omitted, all preview servers
+            started by this MCP process are stopped.
+
+    Returns:
+        A JSON string listing the stopped ports and the number of remaining
+        active preview servers.
+    """
+    with _PREVIEW_SERVERS_LOCK:
+        if port is None:
+            targets = [
+                (key, server, server.server_address[1])
+                for key, server in _PREVIEW_SERVERS.items()
+            ]
+            _PREVIEW_SERVERS.clear()
+        else:
+            targets = [
+                (key, server, server.server_address[1])
+                for key, server in _PREVIEW_SERVERS.items()
+                if server.server_address[1] == port
+            ]
+            for key, _, _ in targets:
+                _PREVIEW_SERVERS.pop(key, None)
+
+    stopped: list[int] = []
+    for _, server, bound_port in targets:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            continue
+        stopped.append(bound_port)
+
+    return json.dumps(
+        {
+            "success": True,
+            "stopped_ports": stopped,
+            "remaining": len(_PREVIEW_SERVERS),
+        },
+        indent=2,
+    )
 
 
 PREVIEW_IMAGE_FORMATS = {"png", "jpg", "jpeg", "webp"}

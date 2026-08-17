@@ -3,6 +3,7 @@
 import asyncio
 import json
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,9 @@ from mcp_manim_slides.server import (
     mcp,
     preview_slide,
     revealjs_config_options,
+    serve_revealjs_html,
     server_status,
+    stop_preview_server,
 )
 
 
@@ -856,3 +859,115 @@ async def test_server_list_tools_includes_preview_and_list_scenes():
     preview_tool = next(t for t in tools if t.name == "preview_slide")
     assert "scene" in preview_tool.input_schema["properties"]
     assert "output_format" in preview_tool.input_schema["properties"]
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_preview_servers():
+    """Stop any preview servers started during a test after it finishes."""
+    yield
+    stop_preview_server()
+
+
+def test_serve_revealjs_html_missing_file(tmp_path):
+    """Verify serve_revealjs_html reports an error for a missing deck."""
+    result = json.loads(
+        serve_revealjs_html(dest="nope.html", workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_serve_revealjs_html_rejects_non_html(tmp_path):
+    """Verify serve_revealjs_html rejects a non-HTML file."""
+    (tmp_path / "deck.pdf").write_text("not html")
+    result = json.loads(
+        serve_revealjs_html(dest="deck.pdf", workspace_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert ".html" in result["error"]
+
+
+def test_serve_revealjs_html_success_and_fetch(tmp_path):
+    """Verify the deck is served and its content is reachable over HTTP."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    result = json.loads(
+        serve_revealjs_html(
+            dest="deck.html",
+            workspace_dir=str(tmp_path),
+            open_browser=False,
+        )
+    )
+    assert result["success"] is True
+    assert result["port"] > 0
+    assert result["url"].endswith("/deck.html")
+    assert result["reused"] is False
+    assert result["browser_opened"] is False
+
+    with urllib.request.urlopen(result["url"], timeout=5) as response:
+        assert b"deck" in response.read()
+
+
+def test_serve_revealjs_html_reuses_server(tmp_path):
+    """Verify a second serve call reuses the existing server for a directory."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    first = json.loads(
+        serve_revealjs_html(
+            dest="deck.html",
+            workspace_dir=str(tmp_path),
+            open_browser=False,
+        )
+    )
+    second = json.loads(
+        serve_revealjs_html(
+            dest="deck.html",
+            workspace_dir=str(tmp_path),
+            open_browser=False,
+        )
+    )
+    assert first["success"] is True
+    assert second["success"] is True
+    assert second["reused"] is True
+    assert second["port"] == first["port"]
+
+
+def test_stop_preview_server_by_port(tmp_path):
+    """Verify stop_preview_server shuts down the server bound to a port."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    result = json.loads(
+        serve_revealjs_html(
+            dest="deck.html",
+            workspace_dir=str(tmp_path),
+            open_browser=False,
+        )
+    )
+    port = result["port"]
+    stop = json.loads(stop_preview_server(port=port))
+    assert stop["success"] is True
+    assert port in stop["stopped_ports"]
+    assert stop["remaining"] == 0
+
+
+def test_stop_preview_server_all(tmp_path):
+    """Verify stop_preview_server without a port stops every preview server."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    serve_revealjs_html(
+        dest="deck.html", workspace_dir=str(tmp_path), open_browser=False
+    )
+    stop = json.loads(stop_preview_server())
+    assert stop["success"] is True
+    assert len(stop["stopped_ports"]) == 1
+    assert stop["remaining"] == 0
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_serve_and_stop():
+    """Verify serve_revealjs_html and stop_preview_server are registered."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "serve_revealjs_html" in tool_names
+    assert "stop_preview_server" in tool_names
+
+    serve_tool = next(t for t in tools if t.name == "serve_revealjs_html")
+    assert "dest" in serve_tool.input_schema["properties"]
+    assert "port" in serve_tool.input_schema["properties"]
+    assert "open_browser" in serve_tool.input_schema["properties"]
