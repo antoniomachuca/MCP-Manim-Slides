@@ -6,12 +6,16 @@ interactive presentations using Manim Community and Manim-Slides.
 
 from __future__ import annotations
 
+import argparse
+import ast
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -75,6 +79,40 @@ def revealjs_config_options() -> str:
     )
 
 
+@mcp.resource("slides://list")
+def slides_list() -> str:
+    """List all rendered slide configurations and metadata in the workspace.
+
+    Reads the slide configuration files (``<scene>.json``) produced by
+    ``manim-slides render`` from the default ``slides`` folder inside the
+    active workspace (``WORKSPACE_DIR`` environment variable or the current
+    directory). Unlike the ``list_scenes`` tool, this read-only resource
+    always targets the active workspace and takes no arguments.
+
+    Returns:
+        A JSON string listing the discovered scenes and their slide metadata.
+    """
+    cwd = os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath("slides")
+    if not folder_path.is_dir():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Slides folder not found: {folder_path}",
+            }
+        )
+    scenes = _collect_scene_metadata(folder_path)
+    return json.dumps(
+        {
+            "success": True,
+            "folder": str(folder_path.resolve()),
+            "scene_count": len(scenes),
+            "scenes": scenes,
+        },
+        indent=2,
+    )
+
+
 @mcp.tool()
 def hello_world(name: str = "World") -> str:
     """A basic Hello World tool to verify client-server communication.
@@ -97,6 +135,74 @@ def _manim_slides_executable() -> list[str]:
     if executable:
         return [executable]
     return [sys.executable, "-m", "manim_slides"]
+
+
+def _module_available(name: str) -> bool:
+    """Return True if ``name`` is importable.
+
+    Guards against packages whose ``__spec__`` is ``None`` (which makes
+    ``importlib.util.find_spec`` raise ``ValueError`` even though the module is
+    already importable).
+    """
+    if name in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+def _manim_slides_availability_error() -> str | None:
+    """Return a clear error if manim-slides cannot be invoked, else None.
+
+    Checks both the ``manim-slides`` console script and the ``manim_slides``
+    Python module so rendering/compilation fails fast with an actionable
+    message instead of an opaque subprocess error when the dependency is
+    missing from the environment.
+    """
+    if shutil.which("manim-slides") is not None:
+        return None
+    if _module_available("manim_slides"):
+        return None
+    return (
+        "manim-slides is not installed in the current environment. "
+        "Install it with 'pip install manim-slides' to render or compile "
+        "presentations."
+    )
+
+
+def _validate_python_syntax(code: str) -> str | None:
+    """Return a clear error message for invalid Python code, or None.
+
+    Pre-validates user-provided code so syntax errors fail fast (before any
+    subprocess is spawned) with a precise line number and message.
+    """
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        lineno = exc.lineno or "?"
+        return f"SyntaxError at line {lineno}: {exc.msg}"
+    except (ValueError, TypeError) as exc:
+        return f"Invalid Python code: {exc}"
+    return None
+
+
+_MODULE_NOT_FOUND_RE = re.compile(
+    r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]"
+)
+
+
+def _extract_missing_module(stderr: str) -> str | None:
+    """Return the name of a missing Python module from stderr, or None.
+
+    Detects ``ModuleNotFoundError`` traces produced when user code imports a
+    dependency that is not installed, so the tool can surface an actionable
+    hint instead of a raw traceback.
+    """
+    match = _MODULE_NOT_FOUND_RE.search(stderr)
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def _quote_js_string(val: str) -> str:
@@ -267,6 +373,9 @@ def _run_convert(
     timeout: int,
 ) -> str:
     """Run a ``manim-slides convert`` command and return a structured JSON result."""
+    availability_error = _manim_slides_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error})
     try:
         result = subprocess.run(
             command,
@@ -631,6 +740,33 @@ def _load_scene_config(folder_path: Path, scene: str) -> dict | None:
         return None
 
 
+def _collect_scene_metadata(folder_path: Path) -> list[dict]:
+    """Collect slide metadata for every rendered scene config in ``folder_path``."""
+    scenes = []
+    for json_file in sorted(folder_path.glob("*.json")):
+        data = _load_scene_config(folder_path, json_file.stem)
+        if data is None:
+            continue
+        slides = data.get("slides", [])
+        scenes.append(
+            {
+                "scene": json_file.stem,
+                "slide_count": len(slides),
+                "resolution": data.get("resolution"),
+                "background_color": data.get("background_color"),
+                "slides": [
+                    {
+                        "index": index,
+                        "type": slide.get("type"),
+                        "file": slide.get("file"),
+                    }
+                    for index, slide in enumerate(slides)
+                ],
+            }
+        )
+    return scenes
+
+
 def _resolve_slide_media(cwd: str | None, slide: dict) -> Path | None:
     """Resolve the media file for a slide relative to the workspace root."""
     file = slide.get("file")
@@ -664,28 +800,7 @@ def list_scenes(folder: str = "slides", workspace_dir: str | None = None) -> str
                 "error": f"Slides folder not found: {folder_path}",
             }
         )
-    scenes = []
-    for json_file in sorted(folder_path.glob("*.json")):
-        data = _load_scene_config(folder_path, json_file.stem)
-        if data is None:
-            continue
-        slides = data.get("slides", [])
-        scenes.append(
-            {
-                "scene": json_file.stem,
-                "slide_count": len(slides),
-                "resolution": data.get("resolution"),
-                "background_color": data.get("background_color"),
-                "slides": [
-                    {
-                        "index": index,
-                        "type": slide.get("type"),
-                        "file": slide.get("file"),
-                    }
-                    for index, slide in enumerate(slides)
-                ],
-            }
-        )
+    scenes = _collect_scene_metadata(folder_path)
     return json.dumps(
         {
             "success": True,
@@ -1144,6 +1259,22 @@ async def _pump_progress_stream(
     return b"".join(raw).decode("utf-8", errors="replace")
 
 
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Terminate a subprocess and its children.
+
+    Manim/ffmpeg spawn child processes, so killing only the direct child can
+    leave orphans that keep holding the workspace lock. On POSIX we kill the
+    whole process group; elsewhere we fall back to killing the child directly.
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    process.kill()
+
+
 async def _run_render_streaming(
     command: list[str],
     workspace: Path,
@@ -1160,6 +1291,7 @@ async def _run_render_streaming(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workspace,
+        start_new_session=True,
     )
 
     async def on_segment(segment: str) -> None:
@@ -1179,7 +1311,7 @@ async def _run_render_streaming(
     try:
         returncode = await asyncio.wait_for(process.wait(), timeout=timeout)
     except asyncio.TimeoutError:
-        process.kill()
+        _kill_process_tree(process)
         await process.wait()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         await _report_render_progress(ctx, 100.0, 100.0, "Render timed out.")
@@ -1201,6 +1333,13 @@ async def _run_render_streaming(
     }
     if returncode != 0:
         output["error"] = stderr_text.strip() or "Unknown render error."
+        missing_module = _extract_missing_module(stderr_text)
+        if missing_module:
+            output["missing_dependency"] = missing_module
+            output["hint"] = (
+                f"The Python module '{missing_module}' is not installed. "
+                f"Install it with 'pip install {missing_module}'."
+            )
     await _report_render_progress(ctx, 100.0, 100.0, "Render complete.")
     return output
 
@@ -1244,6 +1383,14 @@ async def execute_manim_code(
         ``cached`` to True and omits the command.
     """
     workspace = _resolve_workspace_dir(media_dir)
+
+    syntax_error = _validate_python_syntax(code)
+    if syntax_error:
+        return json.dumps({"success": False, "error": syntax_error})
+
+    availability_error = _manim_slides_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error})
 
     if use_cache:
         key = _render_cache_key(code, scenes, quality)
@@ -1322,8 +1469,36 @@ async def execute_manim_code(
 
 
 def main() -> None:
-    """Run the Manim-Slides MCP server using stdio transport."""
-    mcp.run(transport="stdio")
+    """Run the Manim-Slides MCP server.
+
+    Transport is selected via ``--transport`` (default ``stdio`` for local
+    AI desktop clients). Use ``--transport streamable-http`` to expose the
+    server over HTTP for remote clients (e.g. Claude.ai via a public tunnel).
+    """
+    parser = argparse.ArgumentParser(description="Manim-Slides MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "sse", "streamable-http"),
+        default="stdio",
+        help="MCP transport to use (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for HTTP transports (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Bind port for HTTP transports (default: 8000)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

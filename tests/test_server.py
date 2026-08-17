@@ -3,6 +3,8 @@
 import asyncio
 import json
 import subprocess
+import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -17,13 +19,17 @@ from mcp_manim_slides.server import (
     _build_render_command,
     _build_reveal_config,
     _build_revealjs_export_command,
+    _extract_missing_module,
     _format_progress_message,
     _load_render_cache,
+    _manim_slides_availability_error,
     _parse_render_progress,
     _render_cache_key,
     _restore_render_cache,
+    _run_render_streaming,
     _save_render_cache,
     _temporary_script,
+    _validate_python_syntax,
     _validate_reveal_options,
     compile_presentation,
     execute_manim_code,
@@ -35,6 +41,7 @@ from mcp_manim_slides.server import (
     revealjs_config_options,
     serve_revealjs_html,
     server_status,
+    slides_list,
     stop_preview_server,
 )
 
@@ -70,6 +77,7 @@ async def test_server_list_resources():
     resource_uris = [str(r.uri) for r in resources]
     assert any("status://server" in uri for uri in resource_uris)
     assert any("revealjs://config" in uri for uri in resource_uris)
+    assert any("slides://list" in uri for uri in resource_uris)
 
 
 @pytest.mark.anyio
@@ -481,13 +489,116 @@ async def test_execute_manim_code_failure(monkeypatch, tmp_path):
     """Verify execute_manim_code surfaces the render error on failure."""
     _patch_async_exec(
         monkeypatch,
-        _FakeAsyncProcess(1, stderr=b"SyntaxError: invalid syntax"),
+        _FakeAsyncProcess(1, stderr=b"RuntimeError: something went wrong"),
     )
     result = json.loads(
-        await execute_manim_code(code="invalid python", media_dir=str(tmp_path))
+        await execute_manim_code(
+            code="raise RuntimeError('something went wrong')\n",
+            media_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert "RuntimeError" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_execute_manim_code_syntax_error_no_subprocess(monkeypatch, tmp_path):
+    """Verify invalid code is rejected before any subprocess is spawned."""
+    calls: list[tuple] = []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return _FakeAsyncProcess(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = json.loads(
+        await execute_manim_code(code="def broken(:\n", media_dir=str(tmp_path))
     )
     assert result["success"] is False
     assert "SyntaxError" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_execute_manim_code_missing_dependency(monkeypatch, tmp_path):
+    """Verify missing imports are surfaced with an actionable hint."""
+    _patch_async_exec(
+        monkeypatch,
+        _FakeAsyncProcess(
+            1,
+            stderr=(
+                b"Traceback (most recent call last):\n"
+                b"ModuleNotFoundError: No module named 'numpy'\n"
+            ),
+        ),
+    )
+    result = json.loads(
+        await execute_manim_code(
+            code="import numpy as np\nclass MySlide(Slide): pass\n",
+            media_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert result["missing_dependency"] == "numpy"
+    assert "pip install numpy" in result["hint"]
+
+
+def test_validate_python_syntax_valid():
+    """Verify valid Python code passes syntax validation."""
+    assert _validate_python_syntax("class MySlide(Slide): pass\n") is None
+
+
+def test_validate_python_syntax_invalid():
+    """Verify invalid Python code returns a precise, line-aware error."""
+    error = _validate_python_syntax("def broken(:\n    pass\n")
+    assert error is not None
+    assert "SyntaxError" in error
+    assert "line 1" in error
+
+
+def test_extract_missing_module_detects_import_error():
+    """Verify missing module names are parsed from stderr tracebacks."""
+    stderr = "ModuleNotFoundError: No module named 'requests'"
+    assert _extract_missing_module(stderr) == "requests"
+
+
+def test_extract_missing_module_no_match():
+    """Verify unrelated stderr returns None."""
+    assert _extract_missing_module("Some other error") is None
+
+
+def test_manim_slides_availability_error_resolves(monkeypatch):
+    """Verify availability check passes when the module is importable."""
+    monkeypatch.setattr("mcp_manim_slides.server.shutil.which", lambda _name: None)
+    monkeypatch.setattr("mcp_manim_slides.server._module_available", lambda _name: True)
+    assert _manim_slides_availability_error() is None
+
+
+def test_manim_slides_availability_error_reports(monkeypatch):
+    """Verify availability check reports a clear error when manim-slides is absent."""
+    monkeypatch.setattr("mcp_manim_slides.server.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._module_available", lambda _name: False
+    )
+    error = _manim_slides_availability_error()
+    assert error is not None
+    assert "manim-slides is not installed" in error
+
+
+@pytest.mark.anyio
+async def test_run_render_streaming_timeout_kills_process(tmp_path):
+    """Verify a runaway render is killed and raises TimeoutExpired."""
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with pytest.raises(subprocess.TimeoutExpired):
+        await _run_render_streaming(
+            command=command,
+            workspace=tmp_path,
+            scenes=["Hang"],
+            quality="l",
+            start=time.time(),
+            timeout=1,
+            ctx=None,
+        )
 
 
 @pytest.mark.anyio
@@ -727,6 +838,32 @@ def test_list_scenes_success(tmp_path):
 def test_list_scenes_missing_folder(tmp_path):
     """Verify list_scenes reports an error when the folder is absent."""
     result = json.loads(list_scenes(workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_slides_list_resource(monkeypatch, tmp_path):
+    """Verify the slides://list resource reads the active WORKSPACE_DIR."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [
+            {"type": "video", "file": "slides/files/MySlide/0.mp4"},
+            {"type": "video", "file": "slides/files/MySlide/1.mp4"},
+        ],
+    )
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path))
+    result = json.loads(slides_list())
+    assert result["success"] is True
+    assert result["scene_count"] == 1
+    assert result["scenes"][0]["scene"] == "MySlide"
+    assert result["scenes"][0]["slide_count"] == 2
+
+
+def test_slides_list_resource_missing_folder(monkeypatch, tmp_path):
+    """Verify the slides://list resource reports a missing slides folder."""
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path))
+    result = json.loads(slides_list())
     assert result["success"] is False
     assert "not found" in result["error"]
 
