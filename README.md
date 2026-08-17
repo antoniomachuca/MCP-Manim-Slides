@@ -14,6 +14,8 @@ While traditional AI coding assistants can write Manim code, executing that code
 
 - **Direct Code Execution**: Send Python code containing Manim `Slide` classes; the server handles temporary file creation, execution, and cleanup.
 - **Error Feedback Loop**: Captures standard output and runtime exceptions, feeding them back to the AI for autonomous debugging.
+- **Live Render Progress**: Streams rendered-frame percentage updates to the client via `notifications/progress`.
+- **Render Caching**: Content-hashes each render request (code + scenes + quality) to skip re-rendering unchanged slides, reusing previously rendered media from `.render_cache`.
 - **HTML/Reveal.js Export**: Seamlessly compiles the generated video assets into a fully functional interactive web presentation.
 - **State Management**: Persists generated media in structured workspace directories for easy access.
 
@@ -65,7 +67,7 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
 
 ### Tools (`@mcp.tool`)
 - `hello_world(name: str = "World")`: Connectivity check tool to verify client-server MCP communication.
-- `execute_manim_code(code: str, scenes: list[str] | None = None, quality: str = "l", media_dir: str | None = None, timeout: int = 600)`: Writes the provided Manim code to a secure temporary script, renders the scenes headlessly via `manim-slides render`, and returns paths to produced media files.
+- `execute_manim_code(code: str, scenes: list[str] | None = None, quality: str = "l", media_dir: str | None = None, timeout: int = 600, use_cache: bool = True)`: Writes the provided Manim code to a secure temporary script, renders the scenes headlessly via `manim-slides render`, and returns paths to produced media files. Caches rendered output by a content hash of `code`/`scenes`/`quality` and skips re-rendering unchanged requests unless `use_cache=False`.
 - `compile_presentation(scenes: list[str], dest: str, folder: str = "slides", output_format: str = "auto", config: dict[str, str] | None = None, one_file: bool = False, workspace_dir: str | None = None, timeout: int = 300)`: Compiles rendered slide assets into an interactive presentation via `manim-slides convert` (supports `html`/Reveal.js, `pdf`, `pptx`, `zip`, custom Reveal.js themes and transition configs).
 - `export_revealjs_html(scenes: list[str], dest: str, folder: str = "slides", theme: str = "black", transition: str = "none", transition_speed: str = "default", controls: bool = False, progress: bool = False, slide_number: bool = False, hash: bool = False, loop: bool = False, title: str | None = None, config: dict[str, str] | None = None, one_file: bool = False, offline: bool = False, workspace_dir: str | None = None, timeout: int = 300)`: First-class Reveal.js HTML export via `manim-slides convert --to html`, with typed configuration for themes, transitions, navigation controls, slide numbers, deep linking, looping, and offline/one-file embedding.
 - `preview_slide(scene: str, slide_index: int = 0, output_format: str = "png", folder: str = "slides", workspace_dir: str | None = None, timeout: int = 120)`: Extracts a single slide preview (image frame `png`/`jpg`/`webp`, video snippet `mp4`, or animated `gif`) via FFmpeg for rapid visual validation without compiling the full presentation.

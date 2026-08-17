@@ -6,18 +6,23 @@ interactive presentations using Manim Community and Manim-Slides.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
 
 # Initialize MCP Server with official v2 SDK
 mcp = MCPServer(
@@ -155,10 +160,7 @@ def _validate_reveal_options(
 ) -> str | None:
     """Return an error message for invalid Reveal.js options, or None if valid."""
     if theme not in REVEAL_THEMES:
-        return (
-            f"Invalid theme '{theme}'. "
-            f"Valid themes: {', '.join(REVEAL_THEMES)}."
-        )
+        return f"Invalid theme '{theme}'. Valid themes: {', '.join(REVEAL_THEMES)}."
     if transition not in REVEAL_TRANSITIONS:
         return (
             f"Invalid transition '{transition}'. "
@@ -672,8 +674,7 @@ def preview_slide(
                 {
                     "success": False,
                     "error": (
-                        result.stderr.strip()
-                        or "Unknown preview generation error."
+                        result.stderr.strip() or "Unknown preview generation error."
                     ),
                 }
             )
@@ -694,6 +695,10 @@ def preview_slide(
 
 
 MEDIA_EXTENSIONS = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg"}
+
+CACHE_DIR_NAME = ".render_cache"
+
+CACHEABLE_EXTENSIONS = MEDIA_EXTENSIONS | {".json"}
 
 
 def _resolve_workspace_dir(media_dir: str | None = None) -> Path:
@@ -755,23 +760,295 @@ def _find_media_files(media_dir: Path, since: float) -> list[str]:
         if path.is_file()
         and path.suffix.lower() in MEDIA_EXTENSIONS
         and "partial_movie_files" not in path.parts
+        and CACHE_DIR_NAME not in path.parts
         and path.stat().st_mtime >= since - 1
     )
 
 
+def _render_cache_key(code: str, scenes: list[str] | None, quality: str) -> str:
+    """Return a deterministic content hash for a render request.
+
+    The key captures the source code, the requested scene subset, and the
+    render quality, so unchanged requests map to the same cache entry.
+    """
+    payload = json.dumps(
+        {"code": code, "scenes": scenes, "quality": quality},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _render_cache_entry(workspace: Path, key: str) -> Path:
+    """Return the cache directory for a given render key."""
+    return workspace / CACHE_DIR_NAME / key
+
+
+def _find_rendered_outputs(workspace: Path, since: float) -> list[str]:
+    """Return render outputs (media + slide configs) created since ``since``."""
+    return sorted(
+        str(path)
+        for path in workspace.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in CACHEABLE_EXTENSIONS
+        and "partial_movie_files" not in path.parts
+        and CACHE_DIR_NAME not in path.parts
+        and path.stat().st_mtime >= since - 1
+    )
+
+
+def _save_render_cache(workspace: Path, key: str, files: list[str]) -> Path:
+    """Copy rendered files into the content-addressed cache and write a manifest."""
+    entry = _render_cache_entry(workspace, key)
+    entry.mkdir(parents=True, exist_ok=True)
+    relative_files: list[str] = []
+    for raw_path in files:
+        source = Path(raw_path)
+        relative = source.relative_to(workspace)
+        destination = entry / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        relative_files.append(str(relative))
+    (entry / "manifest.json").write_text(
+        json.dumps({"key": key, "files": relative_files}, indent=2),
+        encoding="utf-8",
+    )
+    return entry
+
+
+def _load_render_cache(workspace: Path, key: str) -> list[str] | None:
+    """Return cached relative file paths for ``key``, or None on a miss.
+
+    A cache entry is only considered valid when its manifest exists and every
+    recorded file is still present on disk.
+    """
+    entry = _render_cache_entry(workspace, key)
+    manifest = entry / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        files = data.get("files")
+        if not isinstance(files, list):
+            return None
+    except (json.JSONDecodeError, OSError):
+        return None
+    if any(not (entry / rel).is_file() for rel in files):
+        return None
+    return files
+
+
+def _restore_render_cache(
+    workspace: Path,
+    key: str,
+    files: list[str],
+) -> list[str]:
+    """Copy cached files back into the workspace and return their absolute paths."""
+    entry = _render_cache_entry(workspace, key)
+    restored: list[str] = []
+    for relative in files:
+        source = entry / relative
+        destination = workspace / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        restored.append(str(destination.resolve()))
+    return restored
+
+
+@dataclass(frozen=True)
+class RenderProgress:
+    """A parsed render-progress update extracted from manim's tqdm output."""
+
+    percent: float
+    current: int | None
+    total: int | None
+    description: str
+
+
+_RENDER_PROGRESS_RE = re.compile(
+    r"(?P<desc>.*?)\s*(?P<percent>\d{1,3})\s*%\s*\|"
+    r".*\|"
+    r"\s*(?P<current>\d+)/(?P<total>\d+|\?)\s*\["
+)
+
+
+def _parse_render_progress(line: str) -> RenderProgress | None:
+    """Parse a tqdm-style progress line into a ``RenderProgress`` update.
+
+    Manim (and manim-slides) report rendering progress through ``tqdm`` bars on
+    stderr, e.g. ``Animation 0: FadeIn(Circle):  50%|█████     | 1/2 [...]``.
+    Returns ``None`` for lines that do not contain a progress bar.
+    """
+    match = _RENDER_PROGRESS_RE.search(line)
+    if match is None:
+        return None
+    percent = float(match.group("percent"))
+    current = int(match.group("current"))
+    total_raw = match.group("total")
+    total = None if total_raw == "?" else int(total_raw)
+    description = match.group("desc").strip().rstrip(":").strip()
+    return RenderProgress(
+        percent=percent,
+        current=current,
+        total=total,
+        description=description,
+    )
+
+
+def _format_progress_message(progress: RenderProgress) -> str:
+    """Render a ``RenderProgress`` update into a human-readable message."""
+    label = progress.description or "Rendering"
+    if progress.total is not None:
+        frames = f"{progress.current}/{progress.total} frames"
+    else:
+        frames = f"{progress.current} frames"
+    return f"{label}: {frames} ({progress.percent:.0f}%)"
+
+
+async def _report_render_progress(
+    ctx: Context | None,
+    progress: float,
+    total: float,
+    message: str,
+) -> None:
+    """Send a ``notifications/progress`` update to the client when available.
+
+    Best-effort by design: a no-op when the tool was invoked without an MCP
+    request context (e.g. a direct function call or unit test) or when the
+    client did not request progress tracking for this request.
+    """
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(progress, total, message)
+    except (AttributeError, ValueError):
+        pass
+
+
+async def _read_stream(stream: asyncio.StreamReader) -> str:
+    """Read an async byte stream to completion and return its decoded text."""
+    chunks: list[bytes] = []
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+async def _pump_progress_stream(
+    stream: asyncio.StreamReader,
+    on_segment: Callable[[str], Awaitable[None]],
+) -> str:
+    """Read ``stream``, emit ``\\r``/``\\n``-delimited segments, return full text.
+
+    tqdm updates in place using carriage returns rather than newlines, so we
+    split the raw stream on both separators to stream each progress update as
+    soon as it is written while still reconstructing the full captured text.
+    """
+    raw: list[bytes] = []
+    buffer = b""
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        raw.append(chunk)
+        buffer += chunk
+        while True:
+            cr = buffer.find(b"\r")
+            lf = buffer.find(b"\n")
+            if cr == -1 and lf == -1:
+                break
+            sep = lf if cr == -1 else (cr if lf == -1 else min(cr, lf))
+            segment = buffer[:sep]
+            buffer = buffer[sep + 1 :]
+            if segment.strip():
+                await on_segment(segment.decode("utf-8", errors="replace"))
+    if buffer.strip():
+        await on_segment(buffer.decode("utf-8", errors="replace"))
+    return b"".join(raw).decode("utf-8", errors="replace")
+
+
+async def _run_render_streaming(
+    command: list[str],
+    workspace: Path,
+    scenes: list[str] | None,
+    quality: str,
+    start: float,
+    timeout: int,
+    ctx: Context | None,
+) -> dict:
+    """Run ``manim-slides render`` and stream frame progress to the client."""
+    await _report_render_progress(ctx, 0.0, 100.0, "Starting render...")
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=workspace,
+    )
+
+    async def on_segment(segment: str) -> None:
+        progress = _parse_render_progress(segment)
+        if progress is None:
+            return
+        await _report_render_progress(
+            ctx,
+            progress.percent,
+            100.0,
+            _format_progress_message(progress),
+        )
+
+    stdout_task = asyncio.create_task(_read_stream(process.stdout))
+    stderr_task = asyncio.create_task(_pump_progress_stream(process.stderr, on_segment))
+
+    try:
+        returncode = await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        await _report_render_progress(ctx, 100.0, 100.0, "Render timed out.")
+        raise subprocess.TimeoutExpired(command, timeout) from None
+
+    stdout_text = await stdout_task
+    stderr_text = await stderr_task
+
+    media_files = _find_media_files(workspace, start)
+    output = {
+        "success": returncode == 0,
+        "scenes": scenes or ["(all)"],
+        "quality": quality,
+        "media_dir": str(workspace.resolve()),
+        "media_files": media_files,
+        "command": command,
+        "stdout": stdout_text.strip(),
+        "stderr": stderr_text.strip(),
+    }
+    if returncode != 0:
+        output["error"] = stderr_text.strip() or "Unknown render error."
+    await _report_render_progress(ctx, 100.0, 100.0, "Render complete.")
+    return output
+
+
 @mcp.tool()
-def execute_manim_code(
+async def execute_manim_code(
     code: str,
     scenes: list[str] | None = None,
     quality: str = "l",
     media_dir: str | None = None,
     timeout: int = 600,
+    use_cache: bool = True,
+    ctx: Context | None = None,
 ) -> str:
     """Execute Manim-Slides Python code and render the resulting scenes.
 
     Writes the provided code to a secure temporary script, renders it with
     ``manim-slides render`` (headless, no preview popup), and returns the
-    produced media files.
+    produced media files. Rendered-frame percentages are streamed to the client
+    as ``notifications/progress`` updates while rendering is in progress.
+
+    Renders are cached by a content hash of ``code``, ``scenes``, and
+    ``quality``: an unchanged request reuses the previously rendered media
+    instead of re-rendering.
 
     Args:
         code: Python source code defining one or more Manim Scene/Slide classes.
@@ -782,12 +1059,41 @@ def execute_manim_code(
         media_dir: Directory where rendered media is stored. Defaults to the
             ``WORKSPACE_DIR`` environment variable or a temporary directory.
         timeout: Maximum time in seconds to wait for rendering.
+        use_cache: When True, reuse previously rendered media for unchanged
+            requests instead of re-rendering. Defaults to True.
 
     Returns:
         A JSON string with the render status, produced media file paths,
-        executed command, and captured stdout/stderr.
+        executed command, and captured stdout/stderr. A cache hit sets
+        ``cached`` to True and omits the command.
     """
     workspace = _resolve_workspace_dir(media_dir)
+
+    if use_cache:
+        key = _render_cache_key(code, scenes, quality)
+        cached_files = _load_render_cache(workspace, key)
+        if cached_files is not None:
+            restored = _restore_render_cache(workspace, key, cached_files)
+            media_files = [
+                path
+                for path in restored
+                if Path(path).suffix.lower() in MEDIA_EXTENSIONS
+            ]
+            await _report_render_progress(ctx, 100.0, 100.0, "Render skipped (cached).")
+            return json.dumps(
+                {
+                    "success": True,
+                    "cached": True,
+                    "scenes": scenes or ["(all)"],
+                    "quality": quality,
+                    "media_dir": str(workspace.resolve()),
+                    "media_files": media_files,
+                    "stdout": "",
+                    "stderr": "",
+                },
+                indent=2,
+            )
+
     start = time.time()
     try:
         with _temporary_script(code, workspace) as script:
@@ -797,27 +1103,25 @@ def execute_manim_code(
                 quality=quality,
                 media_dir=workspace,
             )
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                cwd=workspace,
+            result = await _run_render_streaming(
+                command=command,
+                workspace=workspace,
+                scenes=scenes,
+                quality=quality,
+                start=start,
                 timeout=timeout,
+                ctx=ctx,
             )
-            media_files = _find_media_files(workspace, start)
-            output = {
-                "success": result.returncode == 0,
-                "scenes": scenes or ["(all)"],
-                "quality": quality,
-                "media_dir": str(workspace.resolve()),
-                "media_files": media_files,
-                "command": command,
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip(),
-            }
-            if result.returncode != 0:
-                output["error"] = result.stderr.strip() or "Unknown render error."
-            return json.dumps(output, indent=2)
+        if use_cache and result.get("success"):
+            try:
+                _save_render_cache(
+                    workspace,
+                    _render_cache_key(code, scenes, quality),
+                    _find_rendered_outputs(workspace, start),
+                )
+            except OSError:
+                pass
+        return json.dumps(result, indent=2)
     except subprocess.TimeoutExpired as e:
         return json.dumps(
             {
