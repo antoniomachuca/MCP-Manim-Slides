@@ -23,6 +23,6 @@ def test_manim_slides_import():
 
 
 def test_package_structure():
-    """Verify src package can be imported."""
-    src = importlib.import_module("src")
-    assert src is not None
+    """Verify mcp_manim_slides package can be imported."""
+    mcp_manim_slides = importlib.import_module("mcp_manim_slides")
+    assert mcp_manim_slides is not None

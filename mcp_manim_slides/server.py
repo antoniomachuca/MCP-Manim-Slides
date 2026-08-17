@@ -616,7 +616,8 @@ def preview_slide(
         if not matches:
             command = ["ffmpeg", "-y", "-i", str(media), str(destination)]
     elif output_format == "mp4":
-        pass
+        if media.suffix.lower() != ".mp4":
+            command = ["ffmpeg", "-y", "-i", str(media), str(destination)]
     elif output_format == "gif":
         command = [
             "ffmpeg",

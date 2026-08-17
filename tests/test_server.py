@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.server import (
+from mcp_manim_slides.server import (
     REVEAL_THEMES,
     REVEAL_TRANSITION_SPEEDS,
     REVEAL_TRANSITIONS,
@@ -742,7 +742,10 @@ def test_preview_slide_video_to_png(monkeypatch, tmp_path):
         return _FakeCompletedProcess(0, stdout="ok")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr("src.server._ffmpeg_executable", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
 
     result = json.loads(preview_slide(scene="MySlide", workspace_dir=str(tmp_path)))
     assert result["success"] is True
@@ -769,6 +772,42 @@ def test_preview_slide_video_to_mp4_copy(monkeypatch, tmp_path):
     )
     assert result["success"] is True
     assert result["preview_path"].endswith("MySlide_0.mp4")
+
+
+def test_preview_slide_webm_to_mp4_transcode(monkeypatch, tmp_path):
+    """Verify preview_slide transcodes non-mp4 media instead of renaming it."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.webm"}],
+    )
+
+    captured: dict[str, list] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        destination = Path(command[-1])
+        destination.write_text("fake-mp4")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+
+    result = json.loads(
+        preview_slide(
+            scene="MySlide",
+            slide_index=0,
+            output_format="mp4",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is True
+    assert result["preview_path"].endswith("MySlide_0.mp4")
+    assert captured["command"][0] == "/usr/bin/ffmpeg"
+    assert captured["command"][-1].endswith("MySlide_0.mp4")
 
 
 def test_preview_slide_out_of_range(tmp_path):

@@ -25,10 +25,10 @@ dev = [
 ]
 
 [project.scripts]
-mcp-manim-slides = "src.server:main"
+mcp-manim-slides = "mcp_manim_slides.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["mcp_manim_slides"]
 
 [tool.ruff]
 line-length = 88

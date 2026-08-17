@@ -24,6 +24,7 @@ While traditional AI coding assistants can write Manim code, executing that code
 Ensure your system has the following installed:
 
 - Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (dependency and environment management)
 - [Manim Community Edition](https://docs.manim.community/en/stable/installation.html) (Requires FFmpeg and LaTeX)
 - [Manim-Slides](https://manim-slides.eertmans.be/latest/installation.html)
 
@@ -33,14 +34,10 @@ Ensure your system has the following installed:
 git clone https://github.com/antoniomachuca/MCP-Manim-Slides.git
 cd MCP-Manim-Slides
 
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+# Install uv if needed: https://docs.astral.sh/uv/getting-started/installation/
 
-# Install dependencies
-pip install -r requirements.txt
-# or install in editable mode:
-pip install -e .
+# Create the environment and install the project plus dev dependencies
+uv sync --extra dev
 ```
 
 ## Configuration
@@ -53,7 +50,7 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
     "manim-slides": {
       "command": "/absolute/path/to/MCP-Manim-Slides/.venv/bin/python",
       "args": [
-        "/absolute/path/to/MCP-Manim-Slides/src/server.py"
+        "/absolute/path/to/MCP-Manim-Slides/mcp_manim_slides/server.py"
       ],
       "env": {
         "WORKSPACE_DIR": "/path/to/your/output/directory"
