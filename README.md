@@ -1,5 +1,15 @@
 # Manim-Slides MCP Server
+<div align="center">
 
+[![MCP-Manim-Slides MCP server](https://glama.ai/mcp/servers/antoniomachuca/MCP-Manim-Slides/badges/score.svg)](https://glama.ai/mcp/servers/antoniomachuca/MCP-Manim-Slides)
+[![Release](https://img.shields.io/github/v/release/antoniomachuca/MCP-Manim-Slides?style=flat&color=3B82F6)](https://github.com/antoniomachuca/MCP-Manim-Slides/releases)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat)](https://opensource.org/licenses/MIT)
+[![Code style: ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![CI](https://img.shields.io/github/actions/workflow/status/antoniomachuca/MCP-Manim-Slides/ci.yml?branch=main&label=CI&style=flat)](https://github.com/antoniomachuca/MCP-Manim-Slides/actions)
+
+
+</div>
 A robust Model Context Protocol (MCP) server that empowers AI agents to generate, orchestrate, and compile interactive presentations with manim-slides.
 
 ## Overview
