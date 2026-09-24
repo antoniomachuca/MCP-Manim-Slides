@@ -1468,6 +1468,500 @@ async def execute_manim_code(
         )
 
 
+_PROMPT_TYPOGRAPHY = """\
+Typography and positioning:
+- Use ``Text`` for prose and ``MathTex`` for math; set ``font_size``
+  explicitly (titles 48-64, body 28-36, captions 20-24).
+- Position mobjects with ``to_edge``/``to_corner``/``align_to`` and keep
+  consistent margins; group related mobjects in a ``VGroup`` and tune
+  spacing with ``arrange``.
+- Emphasize with color sparingly (e.g. ``YELLOW`` for the active item,
+  ``GREY_B`` for supporting text) on a dark background."""
+
+_PROMPT_SLIDE_MECHANICS = """\
+Slide mechanics:
+- Subclass ``Slide`` from ``manim_slides`` (not ``Scene``) and import Manim
+  with ``from manim import *``.
+- Call ``self.next_slide()`` after every beat the presenter pauses on:
+  build one idea per beat, animate it, then advance.
+- Name the scene class descriptively so it can be rendered selectively via
+  this server's ``scenes=["<ClassName>"]`` argument."""
+
+_PROMPT_TOOLCHAIN = """\
+After writing the code, iterate with this MCP server's tools:
+``execute_manim_code`` to render the scene, ``preview_slide``/
+``screenshot_deck`` feedback to fix layout or timing, and finally
+``export_revealjs_html`` or ``compile_presentation`` to deliver the deck."""
+
+
+def _split_csv_items(value: str) -> list[str]:
+    """Split a comma-separated prompt argument into trimmed, non-empty items.
+
+    Args:
+        value: Raw comma-separated string (e.g. "Intro, Demo, Results").
+
+    Returns:
+        The individual items with surrounding whitespace removed.
+    """
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _numbered_items(items: list[str]) -> str:
+    """Render items as a numbered list for inclusion in prompt bodies.
+
+    Args:
+        items: Already-trimmed list items.
+
+    Returns:
+        A newline-joined numbered list, or a placeholder when empty.
+    """
+    if not items:
+        return "(none provided)"
+    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
+
+
+@mcp.prompt(
+    name="title_slide",
+    title="Title Slide",
+    description=(
+        "Generate Manim-Slides Python code for an opening title slide "
+        "with a title, optional subtitle, and optional author."
+    ),
+)
+def title_slide(title: str, subtitle: str = "", author: str = "") -> str:
+    """Create a prompt that writes a Manim-Slides opening title slide.
+
+    Args:
+        title: Main presentation title.
+        subtitle: Optional subtitle shown below the title.
+        author: Optional author or presenter name.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the title slide.
+    """
+    content_lines = [f"- title: {title}"]
+    if subtitle:
+        content_lines.append(f"- subtitle: {subtitle}")
+    if author:
+        content_lines.append(f"- author: {author}")
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class TitleSlide(Slide):",
+        "    def construct(self):",
+        f"        title = Text({title!r}, font_size=64)",
+        "        title.to_edge(UP, buff=1.2)",
+    ]
+    if subtitle:
+        skeleton_lines += [
+            f"        subtitle = Text({subtitle!r}, font_size=36)",
+            "        subtitle.next_to(title, DOWN, buff=0.6)",
+        ]
+    if author:
+        skeleton_lines += [
+            f"        author = Text({author!r}, font_size=28)",
+            "        author.to_edge(DOWN, buff=1.2)",
+        ]
+    skeleton_lines.append("        self.play(Write(title), run_time=1.0)")
+    if subtitle:
+        skeleton_lines.append("        self.play(FadeIn(subtitle), run_time=0.6)")
+    if author:
+        skeleton_lines.append("        self.play(FadeIn(author), run_time=0.6)")
+    skeleton_lines += [
+        "        self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for the opening title slide of a",
+            "presentation.",
+            "",
+            "Slide content:",
+            "\n".join(content_lines),
+            "",
+            "Layout:",
+            "- Give the title a single dominant block near the top-center of",
+            "  the frame; the subtitle and author are supporting lines and",
+            "  must never compete in size with the title.",
+            "- Reveal elements in reading order (title, subtitle, author) and",
+            "  pause with ``self.next_slide()`` only once the slide is fully",
+            "  composed, so the presenter can open the talk before advancing.",
+            "- Leave generous negative space and skip decorative mobjects; the",
+            "  opening slide should be readable in one glance.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="agenda",
+    title="Agenda Slide",
+    description=(
+        "Generate Manim-Slides Python code for an agenda slide listing "
+        "the presentation topics as a numbered list."
+    ),
+)
+def agenda(topics: str) -> str:
+    """Create a prompt that writes a Manim-Slides agenda slide.
+
+    Args:
+        topics: Comma-separated agenda topics in presentation order
+            (e.g. "Intro, Demo, Results").
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the agenda slide.
+    """
+    items = _split_csv_items(topics)
+    if items:
+        item_lines = [f"            Text({item!r}, font_size=32)," for item in items]
+    else:
+        item_lines = ['            Text("<topic>", font_size=32),']
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class Agenda(Slide):",
+        "    def construct(self):",
+        '        heading = Text("Agenda", font_size=56)',
+        "        heading.to_edge(UP, buff=1.0)",
+        "        items = VGroup(",
+        *item_lines,
+        "        )",
+        "        items.arrange(DOWN, aligned_edge=LEFT, buff=0.5)",
+        "        items.next_to(heading, DOWN, buff=0.8)",
+        "        self.play(Write(heading))",
+        "        self.next_slide()",
+        "        for item in items:",
+        "            self.play(FadeIn(item, shift=RIGHT * 0.2), run_time=0.4)",
+        "            self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for an agenda slide that lists",
+            "the topics of the presentation.",
+            "",
+            "Slide content (in presentation order):",
+            _numbered_items(items),
+            "",
+            "Layout:",
+            "- One agenda slide with a fixed heading and a vertical numbered",
+            "  list; keep left edges aligned and line spacing even.",
+            "- Reveal topics one at a time with a short fade/shift per line",
+            "  and call ``self.next_slide()`` after each topic so the",
+            "  presenter can introduce each section before it appears.",
+            "- If the list exceeds about seven items, split it across two",
+            "  agenda slides rather than shrinking the font below 28.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="code_walkthrough",
+    title="Code Walkthrough",
+    description=(
+        "Generate Manim-Slides Python code that narrates a real code "
+        "snippet step-by-step across several slides."
+    ),
+)
+def code_walkthrough(code: str, title: str = "") -> str:
+    """Create a prompt that walks through real code across several slides.
+
+    Args:
+        code: The code to narrate, supplied verbatim as source text.
+        title: Optional heading for the walkthrough.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the walkthrough slides.
+    """
+    content_lines = []
+    if title:
+        content_lines.append(f"- title: {title}")
+    content_lines.append("- code: the snippet supplied verbatim below")
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class CodeWalkthrough(Slide):",
+        "    def construct(self):",
+    ]
+    if title:
+        skeleton_lines += [
+            f"        heading = Text({title!r}, font_size=48)",
+            "        heading.to_edge(UP, buff=0.6)",
+        ]
+    skeleton_lines += [
+        "        code = Code(",
+        "            code=SNIPPET,",
+        '            language="python",',
+        "            font_size=24,",
+        '            background="window",',
+        "        )",
+    ]
+    if title:
+        skeleton_lines.append("        code.next_to(heading, DOWN, buff=0.5)")
+    else:
+        skeleton_lines.append("        code.to_edge(UP, buff=0.8)")
+    skeleton_lines += [
+        "        self.play(FadeIn(code))",
+        "        self.next_slide()",
+        '        caption = Text("Step 1: <what happens first>", font_size=28)',
+        "        caption.to_edge(DOWN, buff=0.8)",
+        "        self.play(Write(caption))",
+        "        self.next_slide()",
+        "        # Repeat per narrative step: update the caption, restyle",
+        "        # the lines in focus, then pause with self.next_slide().",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code that narrates the code below",
+            "step-by-step across several slides.",
+            "",
+            "Slide content:",
+            "\n".join(content_lines),
+            "",
+            "Code to narrate (verbatim):",
+            "```python",
+            code,
+            "```",
+            "",
+            "Layout:",
+            "- Keep the code on screen for the whole walkthrough and give it",
+            "  the majority of the frame; narration goes in a one-line caption",
+            "  along the bottom, never over the code.",
+            "- Split the walkthrough into 3-6 narrative steps and make one",
+            "  slide per step: highlight the lines being discussed (e.g.",
+            "  ``YELLOW`` for active, ``GREY_B`` for the rest) and pause with",
+            "  ``self.next_slide()`` after each step.",
+            "- If the code is long, show only the relevant excerpt per step",
+            "  instead of shrinking the font below 20; never alter the code's",
+            "  characters while displaying it.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="math_derivation",
+    title="Math Derivation",
+    description=(
+        "Generate Manim-Slides Python code that reveals a math derivation "
+        "step-by-step across slides."
+    ),
+)
+def math_derivation(steps: str, title: str = "") -> str:
+    """Create a prompt that reveals a math derivation step by step.
+
+    Args:
+        steps: Comma-separated derivation steps written as LaTeX
+            (e.g. "f(x) = x^2, f'(x) = 2x").
+        title: Optional heading for the derivation.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the derivation slides.
+    """
+    items = _split_csv_items(steps)
+    if items:
+        skeleton_lines = [
+            f"        step{index} = MathTex({step!r}, font_size=44)"
+            for index, step in enumerate(items, 1)
+        ]
+        for index in range(2, len(items) + 1):
+            skeleton_lines.append(
+                f"        step{index}.next_to(step{index - 1}, DOWN, buff=0.6)"
+            )
+    else:
+        skeleton_lines = ['        step1 = MathTex("... = ...", font_size=44)']
+    plays = ["        self.play(Write(step1))", "        self.next_slide()"]
+    for index in range(2, len(items) + 1):
+        plays += [
+            f"        self.play(Write(step{index}))",
+            "        self.next_slide()",
+        ]
+
+    header_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class MathDerivation(Slide):",
+        "    def construct(self):",
+    ]
+    if title:
+        header_lines += [
+            f"        heading = Text({title!r}, font_size=48)",
+            "        heading.to_edge(UP, buff=0.6)",
+        ]
+    skeleton_lines = header_lines + skeleton_lines + plays + ["```"]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code that reveals the derivation",
+            "below step by step.",
+            "",
+            "Slide content (in derivation order):",
+            _numbered_items(items),
+            "",
+            "Layout:",
+            "- Show one derivation step per slide and keep earlier steps on",
+            "  screen so the audience sees the derivation build up.",
+            "- Align consecutive steps on the equals sign (or the dominant",
+            "  operator) so the transformation reads vertically; fade older",
+            "  steps toward ``GREY_B`` as the derivation progresses.",
+            "- Pause with ``self.next_slide()`` after revealing each step;",
+            "  if a step needs a long explanation, add a short ``Text``",
+            "  caption below the math instead of cramming the formula.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="two_column_comparison",
+    title="Two-Column Comparison",
+    description=(
+        "Generate Manim-Slides Python code for a side-by-side comparison "
+        "slide with two titled columns of points."
+    ),
+)
+def two_column_comparison(
+    left_title: str,
+    right_title: str,
+    left_points: str,
+    right_points: str,
+) -> str:
+    """Create a prompt that writes a two-column comparison slide.
+
+    Args:
+        left_title: Heading for the left column (e.g. "Pros").
+        right_title: Heading for the right column (e.g. "Cons").
+        left_points: Comma-separated points for the left column.
+        right_points: Comma-separated points for the right column.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the comparison slide.
+    """
+    left_items = _split_csv_items(left_points)
+    right_items = _split_csv_items(right_points)
+    if left_items:
+        left_lines = [
+            f"            Text({item!r}, font_size=28)," for item in left_items
+        ]
+    else:
+        left_lines = ['            Text("<point>", font_size=28),']
+    if right_items:
+        right_lines = [
+            f"            Text({item!r}, font_size=28)," for item in right_items
+        ]
+    else:
+        right_lines = ['            Text("<point>", font_size=28),']
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class TwoColumnComparison(Slide):",
+        "    def construct(self):",
+        f"        left_header = Text({left_title!r}, font_size=40, color=GREEN)",
+        f"        right_header = Text({right_title!r}, font_size=40, color=RED)",
+        "        left_header.to_edge(UL, buff=1.0)",
+        "        right_header.to_edge(UR, buff=1.0)",
+        "        left_items = VGroup(",
+        *left_lines,
+        "        )",
+        "        left_items.arrange(DOWN, aligned_edge=LEFT, buff=0.45)",
+        "        left_items.next_to(left_header, DOWN, buff=0.7)",
+        "        right_items = VGroup(",
+        *right_lines,
+        "        )",
+        "        right_items.arrange(DOWN, aligned_edge=LEFT, buff=0.45)",
+        "        right_items.next_to(right_header, DOWN, buff=0.7)",
+        "        self.play(Write(left_header), Write(right_header))",
+        "        self.next_slide()",
+        "        for left, right in zip(left_items, right_items):",
+        "            self.play(FadeIn(left), FadeIn(right), run_time=0.4)",
+        "            self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for a side-by-side comparison",
+            "slide with two titled columns.",
+            "",
+            "Slide content:",
+            f"Left column - {left_title}:",
+            _numbered_items(left_items),
+            f"Right column - {right_title}:",
+            _numbered_items(right_items),
+            "",
+            "Layout:",
+            "- Mirror the two columns: same widths, same font sizes, same",
+            "  vertical rhythm, with a distinct but balanced color per side",
+            "  so the audience can compare line by line.",
+            "- Keep points short (one line each); align matching points on the",
+            "  same row and top-align both columns even when the point counts",
+            "  differ.",
+            "- Reveal the two headers first, pause with ``self.next_slide()``,",
+            "  then reveal paired points row by row, pausing after each pair.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
 def main() -> None:
     """Run the Manim-Slides MCP server.
 

@@ -1108,3 +1108,139 @@ async def test_server_list_tools_includes_serve_and_stop():
     assert "dest" in serve_tool.input_schema["properties"]
     assert "port" in serve_tool.input_schema["properties"]
     assert "open_browser" in serve_tool.input_schema["properties"]
+
+
+ALL_PROMPT_NAMES = {
+    "title_slide",
+    "agenda",
+    "code_walkthrough",
+    "math_derivation",
+    "two_column_comparison",
+}
+
+
+def _prompt_text(result) -> str:
+    """Return the concatenated text of a GetPromptResult's messages."""
+    return "\n".join(message.content.text for message in result.messages)
+
+
+@pytest.mark.anyio
+async def test_server_list_prompts():
+    """Verify all five slide-archetype prompts are registered."""
+    prompts = await mcp.list_prompts()
+    names = {prompt.name for prompt in prompts}
+    assert ALL_PROMPT_NAMES <= names
+
+
+@pytest.mark.anyio
+async def test_prompt_title_slide_includes_title():
+    """Verify title_slide embeds the given title and chaining instructions."""
+    result = await mcp.get_prompt(
+        "title_slide",
+        {
+            "title": "Quantum Computing 101",
+            "subtitle": "A gentle introduction",
+            "author": "Ada Lovelace",
+        },
+    )
+    text = _prompt_text(result)
+    assert "Quantum Computing 101" in text
+    assert "A gentle introduction" in text
+    assert "Ada Lovelace" in text
+    assert "self.next_slide()" in text
+    assert "execute_manim_code" in text
+    assert "export_revealjs_html" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_agenda_parses_comma_separated_topics():
+    """Verify agenda splits a comma-separated topics string into a list."""
+    result = await mcp.get_prompt("agenda", {"topics": "Intro, Demo, Results"})
+    text = _prompt_text(result)
+    assert "1. Intro" in text
+    assert "2. Demo" in text
+    assert "3. Results" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_code_walkthrough_embeds_code_verbatim():
+    """Verify code_walkthrough keeps the supplied code intact in the body."""
+    snippet = "def answer():\n    return {'value': 42}"
+    result = await mcp.get_prompt(
+        "code_walkthrough", {"code": snippet, "title": "Deep Dive"}
+    )
+    text = _prompt_text(result)
+    assert snippet in text
+    assert "Deep Dive" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_math_derivation_lists_steps():
+    """Verify math_derivation splits comma-separated LaTeX steps."""
+    result = await mcp.get_prompt(
+        "math_derivation", {"steps": "f(x) = x^2, f'(x) = 2x", "title": "Calculus"}
+    )
+    text = _prompt_text(result)
+    assert "1. f(x) = x^2" in text
+    assert "2. f'(x) = 2x" in text
+    assert "Calculus" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_two_column_comparison_lists_both_sides():
+    """Verify two_column_comparison renders both columns' titles and points."""
+    result = await mcp.get_prompt(
+        "two_column_comparison",
+        {
+            "left_title": "Pros",
+            "right_title": "Cons",
+            "left_points": "Fast, Cheap",
+            "right_points": "Limited, Buggy",
+        },
+    )
+    text = _prompt_text(result)
+    assert "Pros" in text
+    assert "Cons" in text
+    assert "1. Fast" in text
+    assert "2. Cheap" in text
+    assert "1. Limited" in text
+    assert "2. Buggy" in text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("title_slide", {"title": "T"}),
+        ("agenda", {"topics": "A"}),
+        ("code_walkthrough", {"code": "pass"}),
+        ("math_derivation", {"steps": "x = 1"}),
+        (
+            "two_column_comparison",
+            {
+                "left_title": "L",
+                "right_title": "R",
+                "left_points": "p1",
+                "right_points": "p2",
+            },
+        ),
+    ],
+)
+async def test_prompt_bodies_include_mechanics_and_toolchain(name, arguments):
+    """Verify every archetype body teaches slide mechanics and the tool chain."""
+    result = await mcp.get_prompt(name, arguments)
+    text = _prompt_text(result)
+    assert "Slide" in text
+    assert "self.next_slide()" in text
+    assert "```python" in text
+    assert "execute_manim_code" in text
+    assert "preview_slide" in text
+    assert "export_revealjs_html" in text
+    assert "compile_presentation" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_missing_required_argument_raises():
+    """Verify the SDK rejects a prompts/get call missing required arguments."""
+    with pytest.raises(ValueError, match="Missing required arguments"):
+        await mcp.get_prompt("title_slide", {})

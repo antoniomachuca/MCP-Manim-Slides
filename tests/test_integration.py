@@ -133,3 +133,41 @@ async def test_serve_and_stop_preview_server(mcp_client, tmp_path):
     assert not stop.is_error
     stopped = json.loads(stop.content[0].text)
     assert served["port"] in stopped["stopped_ports"]
+
+
+ALL_PROMPT_NAMES = {
+    "title_slide",
+    "agenda",
+    "code_walkthrough",
+    "math_derivation",
+    "two_column_comparison",
+}
+
+
+@pytest.mark.anyio
+async def test_list_prompts(mcp_client):
+    """Verify all slide-archetype prompts are exposed over the transport."""
+    prompts = await mcp_client.list_prompts()
+    names = {prompt.name for prompt in prompts.prompts}
+    assert ALL_PROMPT_NAMES <= names
+
+
+@pytest.mark.anyio
+async def test_get_prompt_round_trip(mcp_client):
+    """Verify a prompt renders its arguments over the real stdio transport."""
+    result = await mcp_client.get_prompt(
+        "title_slide",
+        {"title": "Integration Deck", "subtitle": "Over the wire"},
+    )
+    text = result.messages[0].content.text
+    assert "Integration Deck" in text
+    assert "Over the wire" in text
+
+
+@pytest.mark.anyio
+async def test_get_prompt_multi_value_round_trip(mcp_client):
+    """Verify comma-separated prompt arguments parse over the transport."""
+    result = await mcp_client.get_prompt("agenda", {"topics": "Intro, Demo"})
+    text = result.messages[0].content.text
+    assert "1. Intro" in text
+    assert "2. Demo" in text
