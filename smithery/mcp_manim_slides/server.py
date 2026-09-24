@@ -11,6 +11,7 @@ import ast
 import asyncio
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -185,6 +186,57 @@ def _validate_python_syntax(code: str) -> str | None:
     except (ValueError, TypeError) as exc:
         return f"Invalid Python code: {exc}"
     return None
+
+
+def _extract_scene_fragments(code: str) -> tuple[str, dict[str, str]]:
+    """Split ``code`` into a module preamble and per-scene class sources.
+
+    Uses :mod:`ast` to locate top-level ``ClassDef`` nodes (the Manim
+    Scene/Slide classes) and captures each class body with
+    ``ast.get_source_segment`` (including its decorator lines). Everything
+    outside those classes — imports, shared helpers, module-level setup — is
+    returned as the module preamble so that shared code is part of every
+    scene's cache identity.
+
+    The preamble is normalized (blank lines dropped, trailing whitespace
+    stripped) so that adding, removing, or reordering scene classes does not
+    change the preamble and therefore never invalidates the remaining scenes'
+    cache entries.
+
+    Args:
+        code: Python source code defining one or more Manim Scene/Slide classes.
+
+    Returns:
+        A ``(preamble, fragments)`` tuple where ``fragments`` maps each class
+        name to its source. Invalid code returns ``("", {})`` — callers are
+        expected to pre-validate syntax (see ``_validate_python_syntax``).
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return "", {}
+    lines = code.splitlines(keepends=True)
+    fragments: dict[str, str] = {}
+    preamble_lines: list[str] = []
+    index = 0
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        start = node.lineno - 1
+        if node.decorator_list:
+            start = node.decorator_list[0].lineno - 1
+        end = node.end_lineno or node.lineno
+        segment = ast.get_source_segment(code, node)
+        if segment is None:
+            segment = "".join(lines[start:end]).rstrip("\n")
+        elif node.decorator_list:
+            segment = "".join(lines[start : node.lineno - 1]) + segment
+        fragments[node.name] = segment
+        preamble_lines.extend(line for line in lines[index:start] if line.strip())
+        index = end
+    preamble_lines.extend(line for line in lines[index:] if line.strip())
+    preamble = "\n".join(line.rstrip() for line in preamble_lines)
+    return preamble, fragments
 
 
 _MODULE_NOT_FOUND_RE = re.compile(
@@ -1069,6 +1121,29 @@ def _render_cache_key(code: str, scenes: list[str] | None, quality: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _scene_cache_key(preamble: str, class_source: str, quality: str) -> str:
+    """Return a deterministic content hash for a single scene render.
+
+    The key captures the shared module preamble, the scene's own class source,
+    and the render quality. Editing one scene class therefore never
+    invalidates the cache entries of its siblings, while a change to shared
+    helpers or imports invalidates every scene that uses them.
+
+    Args:
+        preamble: Module source outside any scene class (imports, helpers).
+        class_source: Source of the scene's ``ClassDef`` (with decorators).
+        quality: Render quality used for the scene.
+
+    Returns:
+        A hex-encoded SHA-256 digest identifying the scene's render outputs.
+    """
+    payload = json.dumps(
+        {"module": preamble, "scene": class_source, "quality": quality},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _render_cache_entry(workspace: Path, key: str) -> Path:
     """Return the cache directory for a given render key."""
     return workspace / CACHE_DIR_NAME / key
@@ -1143,6 +1218,187 @@ def _restore_render_cache(
         shutil.copy2(source, destination)
         restored.append(str(destination.resolve()))
     return restored
+
+
+def _scene_output_files(
+    workspace: Path,
+    scene: str,
+    outputs: list[str],
+) -> list[str]:
+    """Return the subset of rendered outputs belonging to a single scene.
+
+    A scene's outputs are its slide config (``slides/<Scene>.json``), the
+    media files that config references, and any rendered file named after the
+    scene (e.g. ``videos/480p15/<Scene>.mp4``). Keeping entries per scene is
+    what allows a cache hit for one scene to be restored independently of its
+    siblings.
+
+    Args:
+        workspace: Directory that contains the rendered media tree.
+        scene: Name of the Scene/Slide class.
+        outputs: Absolute paths of files produced by the render, as returned
+            by ``_find_rendered_outputs``.
+
+    Returns:
+        Sorted absolute paths of the scene's cacheable output files. Paths are
+        kept in ``workspace``-relative prefix form so they can be stored by
+        ``_save_render_cache``.
+    """
+    picked: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        raw = str(path)
+        if raw in seen:
+            return
+        if path.suffix.lower() not in CACHEABLE_EXTENSIONS:
+            return
+        if not path.is_file():
+            return
+        seen.add(raw)
+        picked.append(raw)
+
+    add(workspace / "slides" / f"{scene}.json")
+    data = _load_scene_config(workspace / "slides", scene)
+    for slide in (data or {}).get("slides", []):
+        file = slide.get("file")
+        if file:
+            add(Path(file) if os.path.isabs(file) else workspace / file)
+    for raw in outputs:
+        path = Path(raw)
+        if path.stem == scene:
+            add(path)
+    return sorted(picked)
+
+
+def _plan_scene_cache(
+    workspace: Path,
+    preamble: str,
+    fragments: dict[str, str],
+    requested: list[str],
+    quality: str,
+    use_cache: bool,
+) -> tuple[dict[str, bool], list[str], list[str], dict[str, str]]:
+    """Resolve per-scene cache hits and restore cached outputs.
+
+    For every requested scene a cache key is derived from the module preamble
+    plus that scene's class source. Scenes whose entry is present are restored
+    into the workspace; the rest are the render misses.
+
+    Args:
+        workspace: Directory holding the render cache and media tree.
+        preamble: Module source outside any scene class.
+        fragments: Mapping of scene name to class source from
+            ``_extract_scene_fragments``.
+        requested: Names of the scenes the caller wants rendered.
+        quality: Render quality used to derive cache keys.
+        use_cache: When False every scene is treated as a miss.
+
+    Returns:
+        Tuple of ``(scene_cache, missed, restored_media, scene_keys)``:
+        per-scene hit flags, the scene names that need rendering, restored
+        media paths, and the per-scene cache keys for extractable scenes.
+    """
+    scene_cache: dict[str, bool] = {}
+    missed: list[str] = []
+    restored_media: list[str] = []
+    scene_keys: dict[str, str] = {}
+    for scene in requested:
+        source = fragments.get(scene)
+        key = None
+        if source is not None:
+            key = _scene_cache_key(preamble, source, quality)
+            scene_keys[scene] = key
+        hit = False
+        if use_cache and key is not None:
+            files = _load_render_cache(workspace, key)
+            if files is not None:
+                try:
+                    restored = _restore_render_cache(workspace, key, files)
+                except OSError:
+                    restored = None
+                if restored is not None:
+                    hit = True
+                    restored_media.extend(
+                        path
+                        for path in restored
+                        if Path(path).suffix.lower() in MEDIA_EXTENSIONS
+                    )
+        scene_cache[scene] = hit
+        if not hit:
+            missed.append(scene)
+    return scene_cache, missed, restored_media, scene_keys
+
+
+def _cache_scene_outputs(
+    workspace: Path,
+    scene_keys: dict[str, str],
+    rendered: list[str],
+    outputs: list[str],
+) -> None:
+    """Store one cache entry per rendered scene, keyed by its class source.
+
+    Args:
+        workspace: Directory holding the render cache and media tree.
+        scene_keys: Mapping of scene name to its per-scene cache key.
+        rendered: Names of the scenes produced by the render.
+        outputs: Absolute paths of files produced by the render.
+    """
+    for scene in rendered:
+        key = scene_keys.get(scene)
+        if key is None:
+            continue
+        files = _scene_output_files(workspace, scene, outputs)
+        if not files:
+            continue
+        try:
+            _save_render_cache(workspace, key, files)
+        except (OSError, ValueError):
+            pass
+
+
+SYNC_STATE_NAME = ".sync_state.json"
+
+
+def _load_sync_state(workspace: Path) -> dict[str, dict]:
+    """Return the scene state map recorded by the last successful sync.
+
+    Args:
+        workspace: Directory holding the ``.sync_state.json`` state file.
+
+    Returns:
+        A mapping of scene name to its recorded entry (``{"key": ...}``).
+        Missing or corrupt state files yield an empty mapping.
+    """
+    path = workspace / SYNC_STATE_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    scenes = data.get("scenes")
+    if not isinstance(scenes, dict):
+        return {}
+    return {name: entry for name, entry in scenes.items() if isinstance(entry, dict)}
+
+
+def _save_sync_state(workspace: Path, scenes: dict[str, dict]) -> Path:
+    """Write the scene state map produced by a successful sync.
+
+    Args:
+        workspace: Directory holding the ``.sync_state.json`` state file.
+        scenes: Mapping of scene name to its entry (``{"key": ...}``).
+
+    Returns:
+        The path of the written state file.
+    """
+    path = workspace / SYNC_STATE_NAME
+    path.write_text(
+        json.dumps({"scenes": scenes}, indent=2),
+        encoding="utf-8",
+    )
+    return path
 
 
 @dataclass(frozen=True)
@@ -1344,6 +1600,64 @@ async def _run_render_streaming(
     return output
 
 
+def _run_render_sync(
+    command: list[str],
+    workspace: Path,
+    scenes: list[str] | None,
+    quality: str,
+    start: float,
+    timeout: int,
+    ctx: Context | None = None,
+) -> dict:
+    """Run the streaming render pipeline from synchronous code.
+
+    Delegates to ``_run_render_streaming`` and drives its coroutine on a
+    private event loop, so synchronous tools can reuse the exact render and
+    progress path used by ``execute_manim_code``.
+
+    Args:
+        command: The ``manim-slides render`` argument list.
+        workspace: Working directory for the render.
+        scenes: Scene names passed to the render, or None for all scenes.
+        quality: Render quality label reported in the result.
+        start: Timestamp used to discover freshly rendered outputs.
+        timeout: Maximum render time in seconds.
+        ctx: Optional MCP context for progress notifications.
+
+    Returns:
+        The render result dictionary produced by ``_run_render_streaming``.
+    """
+    outcome = _run_render_streaming(
+        command=command,
+        workspace=workspace,
+        scenes=scenes,
+        quality=quality,
+        start=start,
+        timeout=timeout,
+        ctx=ctx,
+    )
+    if not inspect.isawaitable(outcome):
+        return outcome
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(outcome)
+    result: dict = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(outcome)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 @mcp.tool()
 async def execute_manim_code(
     code: str,
@@ -1361,9 +1675,11 @@ async def execute_manim_code(
     produced media files. Rendered-frame percentages are streamed to the client
     as ``notifications/progress`` updates while rendering is in progress.
 
-    Renders are cached by a content hash of ``code``, ``scenes``, and
-    ``quality``: an unchanged request reuses the previously rendered media
-    instead of re-rendering.
+    Renders are cached per scene by a content hash of the shared module
+    preamble, the scene's class source, and ``quality``: editing one scene
+    never invalidates the cache entries of its siblings, and only scenes whose
+    source changed are passed to the renderer. Code without top-level scene
+    classes falls back to the legacy whole-file cache key.
 
     Args:
         code: Python source code defining one or more Manim Scene/Slide classes.
@@ -1380,7 +1696,8 @@ async def execute_manim_code(
     Returns:
         A JSON string with the render status, produced media file paths,
         executed command, and captured stdout/stderr. A cache hit sets
-        ``cached`` to True and omits the command.
+        ``cached`` to True and omits the command. ``scene_cache`` reports the
+        per-scene hit/miss outcome.
     """
     workspace = _resolve_workspace_dir(media_dir)
 
@@ -1392,58 +1709,110 @@ async def execute_manim_code(
     if availability_error:
         return json.dumps({"success": False, "error": availability_error})
 
-    if use_cache:
-        key = _render_cache_key(code, scenes, quality)
-        cached_files = _load_render_cache(workspace, key)
-        if cached_files is not None:
-            restored = _restore_render_cache(workspace, key, cached_files)
-            media_files = [
-                path
-                for path in restored
-                if Path(path).suffix.lower() in MEDIA_EXTENSIONS
-            ]
+    preamble, fragments = _extract_scene_fragments(code)
+    requested = list(scenes) if scenes else list(fragments)
+    scene_cache: dict[str, bool] = {}
+    restored_media: list[str] = []
+    scene_keys: dict[str, str] = {}
+    render_scenes: list[str] | None
+
+    if requested:
+        scene_cache, missed, restored_media, scene_keys = _plan_scene_cache(
+            workspace=workspace,
+            preamble=preamble,
+            fragments=fragments,
+            requested=requested,
+            quality=quality,
+            use_cache=use_cache,
+        )
+        if use_cache and not missed:
             await _report_render_progress(ctx, 100.0, 100.0, "Render skipped (cached).")
             return json.dumps(
                 {
                     "success": True,
                     "cached": True,
-                    "scenes": scenes or ["(all)"],
+                    "scenes": requested,
                     "quality": quality,
                     "media_dir": str(workspace.resolve()),
-                    "media_files": media_files,
+                    "media_files": restored_media,
+                    "scene_cache": scene_cache,
                     "stdout": "",
                     "stderr": "",
                 },
                 indent=2,
             )
+        render_scenes = missed
+    else:
+        # Legacy whole-module path for code without top-level scene classes.
+        render_scenes = None
+        if use_cache:
+            key = _render_cache_key(code, scenes, quality)
+            cached_files = _load_render_cache(workspace, key)
+            if cached_files is not None:
+                restored = _restore_render_cache(workspace, key, cached_files)
+                media_files = [
+                    path
+                    for path in restored
+                    if Path(path).suffix.lower() in MEDIA_EXTENSIONS
+                ]
+                await _report_render_progress(
+                    ctx, 100.0, 100.0, "Render skipped (cached)."
+                )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "cached": True,
+                        "scenes": scenes or ["(all)"],
+                        "quality": quality,
+                        "media_dir": str(workspace.resolve()),
+                        "media_files": media_files,
+                        "scene_cache": {},
+                        "stdout": "",
+                        "stderr": "",
+                    },
+                    indent=2,
+                )
 
     start = time.time()
     try:
         with _temporary_script(code, workspace) as script:
             command = _build_render_command(
                 script=script,
-                scenes=scenes,
+                scenes=render_scenes,
                 quality=quality,
                 media_dir=workspace,
             )
             result = await _run_render_streaming(
                 command=command,
                 workspace=workspace,
-                scenes=scenes,
+                scenes=render_scenes,
                 quality=quality,
                 start=start,
                 timeout=timeout,
                 ctx=ctx,
             )
         if use_cache and result.get("success"):
-            try:
-                _save_render_cache(
-                    workspace,
-                    _render_cache_key(code, scenes, quality),
-                    _find_rendered_outputs(workspace, start),
+            outputs = _find_rendered_outputs(workspace, start)
+            if requested:
+                _cache_scene_outputs(
+                    workspace, scene_keys, render_scenes or [], outputs
                 )
-            except OSError:
-                pass
+            else:
+                try:
+                    _save_render_cache(
+                        workspace,
+                        _render_cache_key(code, scenes, quality),
+                        outputs,
+                    )
+                except OSError:
+                    pass
+        if requested:
+            result["scenes"] = requested
+            if restored_media:
+                result["media_files"] = sorted(
+                    set(restored_media) | set(result.get("media_files", []))
+                )
+        result["scene_cache"] = scene_cache
         return json.dumps(result, indent=2)
     except subprocess.TimeoutExpired as e:
         return json.dumps(
@@ -1466,6 +1835,203 @@ async def execute_manim_code(
                 "error": f"Error executing execute_manim_code tool: {e}",
             }
         )
+
+
+@mcp.tool()
+def sync_deck(
+    code: str,
+    scenes: list[str] | None = None,
+    dest: str = "deck.html",
+    folder: str = "slides",
+    quality: str = "l",
+    output_format: str = "auto",
+    config: dict[str, str] | None = None,
+    one_file: bool = False,
+    media_dir: str | None = None,
+    workspace_dir: str | None = None,
+    timeout: int = 600,
+) -> str:
+    """Render changed scenes and recompile the deck in a single call.
+
+    Extracts per-scene fragments from ``code`` and compares each scene's
+    content hash against the per-scene render cache and the state of the last
+    successful sync (``<workspace>/.sync_state.json``). Only new or changed
+    scenes are rendered; unchanged scenes are restored from cache; scenes that
+    disappeared from the code are reported as removed. The deck is then
+    recompiled to ``dest`` with ``manim-slides convert``.
+
+    Args:
+        code: Python source code defining one or more Manim Scene/Slide classes.
+        scenes: Names of the Scene/Slide classes to include, in order. If
+            omitted or empty, all scene classes in the code are included.
+        dest: Destination path for the compiled presentation
+            (e.g., "deck.html").
+        folder: Directory containing the rendered slide assets (default "slides").
+        quality: Render quality: "l" (low), "m" (medium), "h" (high),
+            "p" (2K), or "k" (4K). Defaults to "l".
+        output_format: Conversion format: "auto", "html", "pdf", "pptx", or
+            "zip".
+        config: Extra converter options as key/value pairs
+            (e.g., {"slide_number": "true"}).
+        one_file: Embed all local assets (e.g., videos) into a single output.
+        media_dir: Directory where rendered media is stored. Defaults to
+            ``workspace_dir``, then the ``WORKSPACE_DIR`` environment variable,
+            then a temporary directory.
+        workspace_dir: Working directory used when ``media_dir`` is omitted.
+        timeout: Maximum time in seconds for rendering and conversion.
+
+    Returns:
+        A JSON string with the per-scene outcome (``rendered``, ``reused``,
+        ``removed``, ``scene_cache``), the compiled destination, and the
+        converter output. The sync state is only updated on success.
+    """
+    workspace = _resolve_workspace_dir(media_dir or workspace_dir)
+
+    syntax_error = _validate_python_syntax(code)
+    if syntax_error:
+        return json.dumps({"success": False, "error": syntax_error})
+
+    availability_error = _manim_slides_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error})
+
+    preamble, fragments = _extract_scene_fragments(code)
+    requested = list(scenes) if scenes else list(fragments)
+    if not requested:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "No scenes to sync: define Scene/Slide classes in the code "
+                    "or pass scenes explicitly."
+                ),
+            }
+        )
+
+    previous_state = _load_sync_state(workspace)
+    scene_cache, to_render, restored_media, scene_keys = _plan_scene_cache(
+        workspace=workspace,
+        preamble=preamble,
+        fragments=fragments,
+        requested=requested,
+        quality=quality,
+        use_cache=True,
+    )
+    reused = [scene for scene in requested if scene_cache[scene]]
+    removed = [name for name in previous_state if name not in fragments]
+
+    render_result: dict = {}
+    if to_render:
+        start = time.time()
+        try:
+            with _temporary_script(code, workspace) as script:
+                command = _build_render_command(
+                    script=script,
+                    scenes=to_render,
+                    quality=quality,
+                    media_dir=workspace,
+                )
+                render_result = _run_render_sync(
+                    command=command,
+                    workspace=workspace,
+                    scenes=to_render,
+                    quality=quality,
+                    start=start,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Rendering timed out after {timeout}s: {e}",
+                }
+            )
+        except FileNotFoundError as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"manim-slides executable not found: {e}",
+                }
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Error executing sync_deck tool: {e}",
+                }
+            )
+        if not render_result.get("success"):
+            failure = {
+                "success": False,
+                "error": render_result.get("error") or "Unknown render error.",
+            }
+            for field in ("missing_dependency", "hint"):
+                if render_result.get(field):
+                    failure[field] = render_result[field]
+            return json.dumps(failure, indent=2)
+        _cache_scene_outputs(
+            workspace,
+            scene_keys,
+            to_render,
+            _find_rendered_outputs(workspace, start),
+        )
+
+    convert_command = _build_convert_command(
+        scenes=requested,
+        dest=dest,
+        folder=folder,
+        output_format=output_format,
+        config=config,
+        one_file=one_file,
+    )
+    convert_result = json.loads(
+        _run_convert(
+            convert_command,
+            dest,
+            requested,
+            output_format,
+            str(workspace),
+            timeout,
+        )
+    )
+    if not convert_result.get("success"):
+        return json.dumps(
+            {
+                "success": False,
+                "error": convert_result.get("error") or "Unknown conversion error.",
+            },
+            indent=2,
+        )
+
+    new_state = {
+        name: {"key": _scene_cache_key(preamble, source, quality)}
+        for name, source in fragments.items()
+    }
+    try:
+        _save_sync_state(workspace, new_state)
+    except OSError:
+        pass
+
+    return json.dumps(
+        {
+            "success": True,
+            "scenes": requested,
+            "rendered": to_render,
+            "reused": reused,
+            "removed": removed,
+            "dest": convert_result["destination"],
+            "media_files": sorted(
+                set(restored_media) | set(render_result.get("media_files", []))
+            ),
+            "scene_cache": scene_cache,
+            "quality": quality,
+            "format": convert_result.get("format"),
+            "command": convert_result.get("command"),
+            "stdout": convert_result.get("stdout"),
+            "stderr": convert_result.get("stderr"),
+        },
+        indent=2,
+    )
 
 
 def main() -> None:

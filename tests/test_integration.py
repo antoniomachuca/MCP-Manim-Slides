@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALL_TOOL_NAMES = {
     "hello_world",
     "execute_manim_code",
+    "sync_deck",
     "compile_presentation",
     "export_revealjs_html",
     "list_scenes",
@@ -84,6 +85,16 @@ async def test_call_execute_manim_code_syntax_error(mcp_client):
     result = await mcp_client.call_tool(
         "execute_manim_code", {"code": "def broken(:\n"}
     )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "SyntaxError" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_sync_deck_syntax_error(mcp_client):
+    """Verify sync_deck fails fast with a clean error over the transport."""
+    result = await mcp_client.call_tool("sync_deck", {"code": "def broken(:\n"})
     assert not result.is_error
     payload = json.loads(result.content[0].text)
     assert payload["success"] is False
