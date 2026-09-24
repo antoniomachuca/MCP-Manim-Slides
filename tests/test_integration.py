@@ -23,9 +23,11 @@ ALL_TOOL_NAMES = {
     "execute_manim_code",
     "compile_presentation",
     "export_revealjs_html",
+    "apply_deck_layout",
     "list_scenes",
     "preview_slide",
     "serve_revealjs_html",
+    "serve_deck_editor",
     "stop_preview_server",
 }
 
@@ -133,3 +135,24 @@ async def test_serve_and_stop_preview_server(mcp_client, tmp_path):
     assert not stop.is_error
     stopped = json.loads(stop.content[0].text)
     assert served["port"] in stopped["stopped_ports"]
+
+
+@pytest.mark.anyio
+async def test_call_apply_deck_layout_missing_layout(mcp_client, tmp_path):
+    """Verify apply_deck_layout reports a missing layout over the transport."""
+    (tmp_path / "deck.html").write_text(
+        "<html><body><section>a</section></body></html>"
+    )
+
+    result = await mcp_client.call_tool(
+        "apply_deck_layout",
+        {
+            "dest": "deck.html",
+            "layout_path": "missing.json",
+            "workspace_dir": str(tmp_path),
+        },
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
