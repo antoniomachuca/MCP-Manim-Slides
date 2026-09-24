@@ -8,3 +8,8 @@ dependencies = [
     "manim>=0.18.1",
     "manim-slides>=5.2.0",
 ]
+
+[project.optional-dependencies]
+vision = [
+    "playwright>=1.40",
+]

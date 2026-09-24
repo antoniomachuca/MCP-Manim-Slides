@@ -27,6 +27,8 @@ ALL_TOOL_NAMES = {
     "preview_slide",
     "serve_revealjs_html",
     "stop_preview_server",
+    "screenshot_deck",
+    "contact_sheet",
 }
 
 
@@ -133,3 +135,27 @@ async def test_serve_and_stop_preview_server(mcp_client, tmp_path):
     assert not stop.is_error
     stopped = json.loads(stop.content[0].text)
     assert served["port"] in stopped["stopped_ports"]
+
+
+@pytest.mark.anyio
+async def test_call_contact_sheet_missing_scene(mcp_client, tmp_path):
+    """Verify contact_sheet reports a missing scene over the transport."""
+    result = await mcp_client.call_tool(
+        "contact_sheet", {"scenes": ["Nope"], "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_screenshot_deck_missing_deck(mcp_client, tmp_path):
+    """Verify screenshot_deck reports a missing deck before touching a browser."""
+    result = await mcp_client.call_tool(
+        "screenshot_deck", {"dest": "nope.html", "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]

@@ -171,6 +171,25 @@ def _manim_slides_availability_error() -> str | None:
     )
 
 
+def _playwright_availability_error() -> str | None:
+    """Return a clear error if Playwright cannot be used, else None.
+
+    Checks both the ``playwright`` console script and the ``playwright``
+    Python module so deck screenshot capture fails fast with an actionable
+    message instead of an opaque import error when the optional vision
+    dependency is missing from the environment.
+    """
+    if shutil.which("playwright") is not None:
+        return None
+    if _module_available("playwright"):
+        return None
+    return (
+        "playwright is not installed in the current environment. "
+        "Install it with 'pip install \"mcp-manim-slides[vision]\"' then "
+        "'playwright install chromium' to capture deck screenshots."
+    )
+
+
 def _validate_python_syntax(code: str) -> str | None:
     """Return a clear error message for invalid Python code, or None.
 
@@ -715,6 +734,226 @@ def stop_preview_server(port: int | None = None) -> str:
     )
 
 
+SCREENSHOT_FORMATS = {"png", "jpg", "webp"}
+
+
+def _capture_deck_screenshots(
+    url: str,
+    output_dir: Path,
+    slides: list[int] | None,
+    width: int,
+    height: int,
+    output_format: str,
+    timeout: int,
+) -> list[dict]:
+    """Capture screenshots of Reveal.js deck slides with a headless browser.
+
+    Launches headless Chromium via Playwright, navigates to the served deck,
+    waits for Reveal.js readiness, and screenshots each target slide's
+    ``.reveal`` element into ``output_dir``.
+
+    Args:
+        url: URL of the served Reveal.js deck.
+        output_dir: Directory where the screenshot files are written.
+        slides: Zero-based slide indices to capture. When None, every slide
+            in the deck is captured (falling back to a single slide when the
+            deck reports no slides).
+        width: Viewport width in pixels.
+        height: Viewport height in pixels.
+        output_format: Image format: "png", "jpg", or "webp".
+        timeout: Maximum time in seconds for each browser operation.
+
+    Returns:
+        A list of ``{"index": i, "slide_path": <abs path>}`` dicts, one per
+        captured slide, in slide order.
+
+    Raises:
+        RuntimeError: If Playwright is not installed or the capture fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        raise RuntimeError(
+            _playwright_availability_error()
+            or "playwright is not installed in the current environment."
+        ) from e
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    captured: list[dict] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(
+                    viewport={"width": width, "height": height},
+                )
+                page.goto(url, timeout=timeout * 1000)
+                try:
+                    page.wait_for_function(
+                        "window.Reveal && Reveal.isReady && Reveal.isReady()",
+                        timeout=min(5000, timeout * 1000),
+                    )
+                except Exception:
+                    page.wait_for_timeout(1500)
+                if slides is None:
+                    total = page.evaluate("Reveal.getTotalSlides()")
+                    try:
+                        total = int(total)
+                    except (TypeError, ValueError):
+                        total = 0
+                    indices = list(range(total)) if total > 0 else [0]
+                else:
+                    indices = list(slides)
+                for index in indices:
+                    page.evaluate(f"Reveal.slide({index})")
+                    page.wait_for_timeout(300)
+                    slide_path = output_dir / f"deck_slide_{index}.{output_format}"
+                    try:
+                        page.locator(".reveal").screenshot(
+                            path=str(slide_path),
+                            timeout=timeout * 1000,
+                        )
+                    except Exception:
+                        page.screenshot(
+                            path=str(slide_path),
+                            timeout=timeout * 1000,
+                        )
+                    captured.append(
+                        {
+                            "index": index,
+                            "slide_path": str(slide_path.resolve()),
+                        }
+                    )
+            finally:
+                browser.close()
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Deck screenshot capture failed: {e}") from e
+    return captured
+
+
+@mcp.tool()
+def screenshot_deck(
+    dest: str,
+    workspace_dir: str | None = None,
+    slides: list[int] | None = None,
+    output_dir: str = "screenshots",
+    width: int = 1920,
+    height: int = 1080,
+    output_format: str = "png",
+    timeout: int = 120,
+) -> str:
+    """Capture screenshots of an exported Reveal.js deck's slides headlessly.
+
+    Serves the deck's directory on a local HTTP server (reusing the ephemeral
+    preview server registry) and captures one screenshot per slide with a
+    headless browser, so an AI agent can "see" its own deck. Requires the
+    optional Playwright vision extra (``mcp-manim-slides[vision]``).
+
+    Args:
+        dest: Path to the exported HTML deck (e.g., "presentation.html").
+            Resolved relative to ``workspace_dir`` when not absolute.
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        slides: Zero-based slide indices to capture. When omitted, every
+            slide in the deck is captured.
+        output_dir: Directory for the screenshot files (default "screenshots"),
+            resolved under the workspace.
+        width: Viewport width in pixels (default 1920).
+        height: Viewport height in pixels (default 1080).
+        output_format: Image format: "png", "jpg", or "webp". Defaults to "png".
+        timeout: Maximum time in seconds for browser navigation and capture.
+
+    Returns:
+        A JSON string with the served deck URL, the absolute output directory,
+        and the captured slide screenshot paths.
+    """
+    output_format = output_format.lower()
+    if output_format not in SCREENSHOT_FORMATS:
+        supported = ", ".join(sorted(SCREENSHOT_FORMATS))
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Unsupported output_format '{output_format}'. "
+                    f"Valid formats: {supported}."
+                ),
+            }
+        )
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR") or "."
+    workspace = Path(cwd).resolve()
+    dest_path = Path(dest)
+    if not dest_path.is_absolute():
+        dest_path = (workspace / dest_path).resolve()
+
+    if not dest_path.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"HTML deck not found: {dest_path}",
+            }
+        )
+    if dest_path.suffix.lower() != ".html":
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Expected an .html file, got: {dest_path}",
+            }
+        )
+
+    availability_error = _playwright_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error})
+
+    try:
+        url_path = dest_path.relative_to(workspace).as_posix()
+        serve_dir = workspace
+    except ValueError:
+        url_path = dest_path.name
+        serve_dir = dest_path.parent
+
+    try:
+        _, bound_port, _ = _start_preview_server(serve_dir, "127.0.0.1", None)
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to start preview server: {e}",
+            }
+        )
+
+    url = f"http://127.0.0.1:{bound_port}/{url_path}"
+    shots_dir = Path(output_dir)
+    if not shots_dir.is_absolute():
+        shots_dir = workspace / shots_dir
+
+    try:
+        shots_dir.mkdir(parents=True, exist_ok=True)
+        captured = _capture_deck_screenshots(
+            url=url,
+            output_dir=shots_dir,
+            slides=slides,
+            width=width,
+            height=height,
+            output_format=output_format,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    return json.dumps(
+        {
+            "success": True,
+            "url": url,
+            "output_dir": str(shots_dir.resolve()),
+            "slides": captured,
+            "count": len(captured),
+        },
+        indent=2,
+    )
+
+
 PREVIEW_IMAGE_FORMATS = {"png", "jpg", "jpeg", "webp"}
 PREVIEW_VIDEO_FORMATS = {"mp4", "gif"}
 
@@ -980,6 +1219,308 @@ def preview_slide(
             "slide_type": slide_type,
             "output_format": output_format,
             "preview_path": str(destination.resolve()),
+        },
+        indent=2,
+    )
+
+
+def _build_contact_sheet_command(
+    frame_paths: list[str],
+    dest: str,
+    columns: int,
+    tile_width: int,
+    tile_height: int | None = None,
+) -> list[str]:
+    """Build the ffmpeg command that montages slide frames into a grid image.
+
+    Each frame is letterboxed into a common tile size (``tile_width`` by
+    ``tile_height``, scaled with its aspect ratio preserved and padded with
+    black) and arranged row-major with ``columns`` tiles per row. When the
+    frame count is not divisible by ``columns``, black filler tiles complete
+    the last row.
+
+    Args:
+        frame_paths: Paths of the extracted slide frames, in slide order.
+        dest: Output path for the composed contact sheet image.
+        columns: Number of tiles per row (at least 1).
+        tile_width: Width in pixels of each tile.
+        tile_height: Height in pixels of each tile. When None, a 16:9 tile
+            height is derived from ``tile_width``.
+
+    Returns:
+        The ffmpeg argument list, with ``"ffmpeg"`` as the executable
+        placeholder at index 0.
+
+    Raises:
+        ValueError: If ``frame_paths`` is empty or ``columns`` is below 1.
+    """
+    if not frame_paths:
+        raise ValueError("frame_paths must not be empty.")
+    if columns < 1:
+        raise ValueError("columns must be at least 1.")
+    if tile_height is None:
+        tile_height = max(2, tile_width * 9 // 16)
+    count = len(frame_paths)
+    rows = (count + columns - 1) // columns
+    total = rows * columns
+    command = ["ffmpeg", "-y"]
+    filters: list[str] = []
+    for index in range(total):
+        if index < count:
+            command += ["-i", frame_paths[index]]
+            filters.append(
+                f"[{index}:v]scale={tile_width}:{tile_height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={tile_width}:{tile_height}:(ow-iw)/2:(oh-ih)/2,"
+                f"format=rgb24[t{index}]"
+            )
+        else:
+            command += [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=black:s={tile_width}x{tile_height}",
+            ]
+            filters.append(f"[{index}:v]format=rgb24[t{index}]")
+    row_labels: list[str] = []
+    for row in range(rows):
+        tiles = [f"t{row * columns + col}" for col in range(columns)]
+        if columns == 1:
+            row_labels.append(tiles[0])
+        else:
+            chain = "".join(f"[{tile}]" for tile in tiles)
+            filters.append(f"{chain}hstack=inputs={columns}[row{row}]")
+            row_labels.append(f"row{row}")
+    if rows == 1:
+        out_label = row_labels[0]
+    else:
+        chain = "".join(f"[{label}]" for label in row_labels)
+        filters.append(f"{chain}vstack=inputs={rows}[out]")
+        out_label = "out"
+    command += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        f"[{out_label}]",
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        dest,
+    ]
+    return command
+
+
+@mcp.tool()
+def contact_sheet(
+    scenes: list[str] | None = None,
+    dest: str = "contact_sheet.png",
+    folder: str = "slides",
+    workspace_dir: str | None = None,
+    columns: int = 3,
+    tile_width: int = 640,
+    timeout: int = 300,
+) -> str:
+    """Compose a grid contact sheet of slide frames using FFmpeg only.
+
+    Extracts one representative frame per slide (via the ffmpeg ``thumbnail``
+    filter) and montages the frames into a single grid image, so an AI agent
+    can review an entire deck at a glance without any browser or extra
+    dependencies. Black filler tiles complete the last row when the slide
+    count is not divisible by ``columns``.
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in
+            order. When omitted, every scene in ``folder`` is included.
+        dest: Destination path for the contact sheet image
+            (e.g., "contact_sheet.png"). Resolved under the workspace.
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        columns: Number of tiles per grid row (default 3).
+        tile_width: Width in pixels of each tile (default 640).
+        timeout: Maximum time in seconds for each ffmpeg invocation.
+
+    Returns:
+        A JSON string with the contact sheet destination, grid dimensions,
+        slide count, and the executed ffmpeg command.
+    """
+    if columns < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid columns {columns}. Must be at least 1.",
+            }
+        )
+    if tile_width < 2:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid tile_width {tile_width}. Must be at least 2.",
+            }
+        )
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+    metadata = _collect_scene_metadata(folder_path)
+    by_name = {entry["scene"]: entry for entry in metadata}
+    if scenes is None:
+        selected = metadata
+        if not selected:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"No rendered scenes found in {folder_path}.",
+                }
+            )
+    else:
+        selected = []
+        for name in scenes:
+            entry = by_name.get(name)
+            if entry is None:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Scene '{name}' not found in {folder_path}.",
+                    }
+                )
+            selected.append(entry)
+
+    media_files: list[Path] = []
+    for entry in selected:
+        for slide in entry["slides"]:
+            media = _resolve_slide_media(cwd, slide)
+            if media is None or not media.is_file():
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Slide media file not found: {slide.get('file')}",
+                    }
+                )
+            media_files.append(media)
+    if not media_files:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"No slides found in {folder_path}.",
+            }
+        )
+
+    ffmpeg = _ffmpeg_executable()
+    if ffmpeg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "ffmpeg executable not found. "
+                    "Install FFmpeg to generate contact sheets."
+                ),
+            }
+        )
+
+    tile_height: int | None = None
+    for entry in selected:
+        resolution = entry.get("resolution")
+        if (
+            isinstance(resolution, list)
+            and len(resolution) == 2
+            and all(isinstance(v, (int, float)) and v > 0 for v in resolution)
+        ):
+            tile_height = max(2, round(tile_width * resolution[1] / resolution[0]))
+            break
+
+    destination = Path(cwd or ".").joinpath(dest).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="contact_sheet_") as tmp:
+        frame_paths: list[str] = []
+        for index, media in enumerate(media_files):
+            frame_path = Path(tmp) / f"slide_{index:04d}.png"
+            command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(media),
+                "-vf",
+                "thumbnail",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                str(frame_path),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Contact sheet generation timed out after "
+                            f"{timeout}s: {e}"
+                        ),
+                    }
+                )
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            result.stderr.strip()
+                            or "Unknown contact sheet generation error."
+                        ),
+                    }
+                )
+            frame_paths.append(str(frame_path))
+
+        command = _build_contact_sheet_command(
+            frame_paths=frame_paths,
+            dest=str(destination),
+            columns=columns,
+            tile_width=tile_width,
+            tile_height=tile_height,
+        )
+        command[0] = ffmpeg
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Contact sheet generation timed out after {timeout}s: {e}"
+                    ),
+                }
+            )
+        if result.returncode != 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        result.stderr.strip()
+                        or "Unknown contact sheet generation error."
+                    ),
+                }
+            )
+
+    rows = (len(media_files) + columns - 1) // columns
+    return json.dumps(
+        {
+            "success": True,
+            "dest": str(destination),
+            "rows": rows,
+            "columns": columns,
+            "slide_count": len(media_files),
+            "command": command,
         },
         indent=2,
     )

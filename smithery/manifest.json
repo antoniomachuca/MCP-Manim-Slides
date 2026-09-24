@@ -4,7 +4,7 @@
   "display_name": "Manim-Slides MCP Server",
   "version": "0.1.0",
   "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
-  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Screenshot every deck slide headlessly so the AI can see its own deck (optional Playwright `vision` extra)\n- Compose FFmpeg-only contact sheet grids of slide frames with no extra dependencies\n- Render caching and live render-progress reporting",
   "author": {
     "name": "Antonio Machuca",
     "url": "https://github.com/antoniomachuca"
@@ -156,6 +156,40 @@
         "type": "object",
         "properties": {
           "port": { "type": "integer", "description": "Port of the server to stop. When omitted, all preview servers are stopped." }
+        }
+      }
+    },
+    {
+      "name": "screenshot_deck",
+      "description": "Capture screenshots of an exported Reveal.js deck's slides with a headless browser (optional Playwright vision extra).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dest": { "type": "string", "description": "Path to the exported HTML deck." },
+          "workspace_dir": { "type": "string" },
+          "slides": { "type": "array", "items": { "type": "integer" }, "description": "Zero-based slide indices to capture. When omitted, every slide is captured." },
+          "output_dir": { "type": "string", "default": "screenshots", "description": "Directory for the screenshot files, resolved under the workspace." },
+          "width": { "type": "integer", "default": 1920, "description": "Viewport width in pixels." },
+          "height": { "type": "integer", "default": 1080, "description": "Viewport height in pixels." },
+          "output_format": { "type": "string", "enum": ["png", "jpg", "webp"], "default": "png" },
+          "timeout": { "type": "integer", "default": 120 }
+        },
+        "required": ["dest"]
+      }
+    },
+    {
+      "name": "contact_sheet",
+      "description": "Compose a grid contact sheet of slide frames with FFmpeg only, no extra dependencies.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the rendered scenes to include, in order. When omitted, every scene is included." },
+          "dest": { "type": "string", "default": "contact_sheet.png", "description": "Destination path for the contact sheet image." },
+          "folder": { "type": "string", "default": "slides" },
+          "workspace_dir": { "type": "string" },
+          "columns": { "type": "integer", "default": 3, "description": "Number of tiles per grid row." },
+          "tile_width": { "type": "integer", "default": 640, "description": "Width in pixels of each tile." },
+          "timeout": { "type": "integer", "default": 300 }
         }
       }
     }
