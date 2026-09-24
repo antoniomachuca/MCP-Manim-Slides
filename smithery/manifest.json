@@ -4,7 +4,7 @@
   "display_name": "Manim-Slides MCP Server",
   "version": "0.1.0",
   "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
-  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- Five slide-archetype prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison) that guide the client LLM in writing Manim-Slides code",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Export a single MP4 by concatenating slide media with optional crossfade transitions\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- Five slide-archetype prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison) that guide the client LLM in writing Manim-Slides code",
   "author": {
     "name": "Antonio Machuca",
     "url": "https://github.com/antoniomachuca"
@@ -20,7 +20,12 @@
     "entry_point": "mcp_manim_slides/server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "${__dirname}", "mcp_manim_slides/server.py"],
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "mcp_manim_slides/server.py"
+      ],
       "env": {
         "WORKSPACE_DIR": "${user_config.workspace_dir}"
       }
@@ -42,7 +47,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "name": { "type": "string", "description": "Name to greet.", "default": "World" }
+          "name": {
+            "type": "string",
+            "description": "Name to greet.",
+            "default": "World"
+          }
         }
       }
     },
@@ -52,14 +61,47 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "code": { "type": "string", "description": "Python source code defining one or more Manim Scene/Slide classes." },
-          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the Scene/Slide classes to render." },
-          "quality": { "type": "string", "enum": ["l", "m", "h", "p", "k"], "default": "l", "description": "Render quality." },
-          "media_dir": { "type": "string", "description": "Directory where rendered media is stored." },
-          "timeout": { "type": "integer", "default": 600, "description": "Maximum render time in seconds." },
-          "use_cache": { "type": "boolean", "default": true, "description": "Reuse previously rendered media for unchanged requests." }
+          "code": {
+            "type": "string",
+            "description": "Python source code defining one or more Manim Scene/Slide classes."
+          },
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the Scene/Slide classes to render."
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "l",
+              "m",
+              "h",
+              "p",
+              "k"
+            ],
+            "default": "l",
+            "description": "Render quality."
+          },
+          "media_dir": {
+            "type": "string",
+            "description": "Directory where rendered media is stored."
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 600,
+            "description": "Maximum render time in seconds."
+          },
+          "use_cache": {
+            "type": "boolean",
+            "default": true,
+            "description": "Reuse previously rendered media for unchanged requests."
+          }
         },
-        "required": ["code"]
+        "required": [
+          "code"
+        ]
       }
     },
     {
@@ -68,16 +110,54 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the rendered scenes to include, in order." },
-          "dest": { "type": "string", "description": "Destination path for the compiled presentation." },
-          "folder": { "type": "string", "default": "slides" },
-          "output_format": { "type": "string", "enum": ["auto", "html", "pdf", "pptx", "zip"], "default": "auto" },
-          "config": { "type": "object", "additionalProperties": { "type": "string" } },
-          "one_file": { "type": "boolean", "default": false },
-          "workspace_dir": { "type": "string" },
-          "timeout": { "type": "integer", "default": 300 }
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the rendered scenes to include, in order."
+          },
+          "dest": {
+            "type": "string",
+            "description": "Destination path for the compiled presentation."
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "html",
+              "pdf",
+              "pptx",
+              "zip"
+            ],
+            "default": "auto"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "one_file": {
+            "type": "boolean",
+            "default": false
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 300
+          }
         },
-        "required": ["scenes", "dest"]
+        "required": [
+          "scenes",
+          "dest"
+        ]
       }
     },
     {
@@ -86,25 +166,82 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the rendered scenes to include, in order." },
-          "dest": { "type": "string", "description": "Destination path for the exported HTML deck." },
-          "folder": { "type": "string", "default": "slides" },
-          "theme": { "type": "string", "default": "black" },
-          "transition": { "type": "string", "default": "none" },
-          "transition_speed": { "type": "string", "default": "default" },
-          "controls": { "type": "boolean", "default": false },
-          "progress": { "type": "boolean", "default": false },
-          "slide_number": { "type": "boolean", "default": false },
-          "hash": { "type": "boolean", "default": false },
-          "loop": { "type": "boolean", "default": false },
-          "title": { "type": "string" },
-          "config": { "type": "object", "additionalProperties": { "type": "string" } },
-          "one_file": { "type": "boolean", "default": false },
-          "offline": { "type": "boolean", "default": false },
-          "workspace_dir": { "type": "string" },
-          "timeout": { "type": "integer", "default": 300 }
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the rendered scenes to include, in order."
+          },
+          "dest": {
+            "type": "string",
+            "description": "Destination path for the exported HTML deck."
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "theme": {
+            "type": "string",
+            "default": "black"
+          },
+          "transition": {
+            "type": "string",
+            "default": "none"
+          },
+          "transition_speed": {
+            "type": "string",
+            "default": "default"
+          },
+          "controls": {
+            "type": "boolean",
+            "default": false
+          },
+          "progress": {
+            "type": "boolean",
+            "default": false
+          },
+          "slide_number": {
+            "type": "boolean",
+            "default": false
+          },
+          "hash": {
+            "type": "boolean",
+            "default": false
+          },
+          "loop": {
+            "type": "boolean",
+            "default": false
+          },
+          "title": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "one_file": {
+            "type": "boolean",
+            "default": false
+          },
+          "offline": {
+            "type": "boolean",
+            "default": false
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 300
+          }
         },
-        "required": ["scenes", "dest"]
+        "required": [
+          "scenes",
+          "dest"
+        ]
       }
     },
     {
@@ -113,14 +250,41 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "scene": { "type": "string", "description": "Name of the rendered Scene/Slide class to preview." },
-          "slide_index": { "type": "integer", "default": 0 },
-          "output_format": { "type": "string", "enum": ["png", "jpg", "jpeg", "webp", "mp4", "gif"], "default": "png" },
-          "folder": { "type": "string", "default": "slides" },
-          "workspace_dir": { "type": "string" },
-          "timeout": { "type": "integer", "default": 120 }
+          "scene": {
+            "type": "string",
+            "description": "Name of the rendered Scene/Slide class to preview."
+          },
+          "slide_index": {
+            "type": "integer",
+            "default": 0
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "png",
+              "jpg",
+              "jpeg",
+              "webp",
+              "mp4",
+              "gif"
+            ],
+            "default": "png"
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 120
+          }
         },
-        "required": ["scene"]
+        "required": [
+          "scene"
+        ]
       }
     },
     {
@@ -129,8 +293,13 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "folder": { "type": "string", "default": "slides" },
-          "workspace_dir": { "type": "string" }
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "workspace_dir": {
+            "type": "string"
+          }
         }
       }
     },
@@ -140,13 +309,28 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "dest": { "type": "string", "description": "Path to the exported HTML deck." },
-          "workspace_dir": { "type": "string" },
-          "host": { "type": "string", "default": "127.0.0.1" },
-          "port": { "type": "integer" },
-          "open_browser": { "type": "boolean", "default": true }
+          "dest": {
+            "type": "string",
+            "description": "Path to the exported HTML deck."
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "port": {
+            "type": "integer"
+          },
+          "open_browser": {
+            "type": "boolean",
+            "default": true
+          }
         },
-        "required": ["dest"]
+        "required": [
+          "dest"
+        ]
       }
     },
     {
@@ -155,18 +339,99 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "port": { "type": "integer", "description": "Port of the server to stop. When omitted, all preview servers are stopped." }
+          "port": {
+            "type": "integer",
+            "description": "Port of the server to stop. When omitted, all preview servers are stopped."
+          }
         }
+      }
+    },
+    {
+      "name": "export_video",
+      "description": "Concatenate slide media across scenes into a single MP4 video with optional crossfade transitions.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the rendered scenes to include, in order."
+          },
+          "dest": {
+            "type": "string",
+            "default": "presentation.mp4",
+            "description": "Destination path for the exported video."
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer",
+            "default": 30,
+            "description": "Frame rate of the exported video."
+          },
+          "width": {
+            "type": "integer",
+            "description": "Target frame width in pixels. Defaults to the first scene's resolution."
+          },
+          "height": {
+            "type": "integer",
+            "description": "Target frame height in pixels. Defaults to the first scene's resolution."
+          },
+          "transition": {
+            "type": "string",
+            "enum": [
+              "none",
+              "fade"
+            ],
+            "default": "none"
+          },
+          "transition_duration": {
+            "type": "number",
+            "default": 0.5,
+            "description": "Duration in seconds of each crossfade."
+          },
+          "image_duration": {
+            "type": "number",
+            "default": 2.0,
+            "description": "Duration in seconds for still-image slides."
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 600
+          }
+        },
+        "required": [
+          "scenes"
+        ]
       }
     }
   ],
   "tools_generated": false,
   "compatibility": {
-    "platforms": ["darwin", "linux", "win32"],
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
     "runtimes": {
       "python": ">=3.10"
     }
   },
-  "keywords": ["manim", "slides", "presentation", "animation", "revealjs", "latex", "education"],
+  "keywords": [
+    "manim",
+    "slides",
+    "presentation",
+    "animation",
+    "revealjs",
+    "latex",
+    "education"
+  ],
   "license": "MIT"
 }

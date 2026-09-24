@@ -729,6 +729,42 @@ def _ffmpeg_executable() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def _ffprobe_duration(path: str | Path) -> float | None:
+    """Return the media duration in seconds reported by ffprobe, or None.
+
+    Args:
+        path: Path to the media file to probe.
+
+    Returns:
+        The duration in seconds, or None when ffprobe is unavailable, the
+        probe fails, or the output cannot be parsed as a number.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _load_scene_config(folder_path: Path, scene: str) -> dict | None:
     """Load a rendered scene's slide configuration from ``folder_path``."""
     config_path = folder_path / f"{scene}.json"
@@ -983,6 +1019,473 @@ def preview_slide(
         },
         indent=2,
     )
+
+
+EXPORT_TRANSITIONS = ("none", "fade")
+
+
+def _concat_list_text(segments: list[str]) -> str:
+    """Return the ffmpeg concat demuxer list-file content for ``segments``.
+
+    Args:
+        segments: Segment file paths to concatenate, in playback order.
+
+    Returns:
+        The text of a concat demuxer list file with one ``file`` directive
+        per segment.
+    """
+    return "".join(f"file '{segment}'\n" for segment in segments)
+
+
+def _build_export_command(
+    media: list[dict],
+    dest: str,
+    width: int,
+    height: int,
+    segment_paths: list[str],
+    fps: int = 30,
+    transition: str = "none",
+    transition_duration: float = 0.5,
+    image_duration: float = 2.0,
+    concat_list_path: str = "concat.txt",
+    durations: list[float] | None = None,
+) -> list[list[str]]:
+    """Build the ffmpeg command pipeline that exports slides to one video.
+
+    Every slide is normalized to an intermediate segment (libx264, yuv420p,
+    shared frame size and rate) with letterbox padding; still-image slides
+    become fixed-duration segments via ``-loop 1``. The segments are then
+    assembled with the concat demuxer (``transition="none"``) or an xfade
+    crossfade chain (``transition="fade"``).
+
+    Args:
+        media: Slides to export, in playback order. Each entry is a dict with
+            "path" (media file) and "type" ("image" for still-image slides).
+        dest: Destination path for the exported video.
+        width: Target frame width in pixels.
+        height: Target frame height in pixels.
+        segment_paths: Output path for each normalized intermediate segment,
+            one per entry in ``media``.
+        fps: Target frame rate for the normalized segments.
+        transition: Assembly mode: "none" (hard cuts) or "fade" (crossfades).
+        transition_duration: Duration in seconds of each crossfade.
+        image_duration: Duration in seconds for still-image slides.
+        concat_list_path: Path of the concat demuxer list file used when
+            ``transition`` is "none".
+        durations: Duration in seconds of each normalized segment. Required
+            to compute xfade offsets when ``transition`` is "fade" and more
+            than one segment is exported.
+
+    Returns:
+        A list of ffmpeg argument lists: one normalization command per slide
+        followed by the final assembly command.
+
+    Raises:
+        ValueError: If ``media`` and ``segment_paths`` differ in length or the
+            fade offsets cannot be computed from ``durations``.
+    """
+    if len(media) != len(segment_paths):
+        raise ValueError("media and segment_paths must have the same length.")
+    normalize_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={fps}"
+    )
+    commands: list[list[str]] = []
+    for slide, segment in zip(media, segment_paths, strict=True):
+        command = ["ffmpeg", "-y"]
+        if slide.get("type") == "image":
+            command += ["-loop", "1", "-t", str(image_duration)]
+        command += [
+            "-i",
+            str(slide["path"]),
+            "-vf",
+            normalize_filter,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(segment),
+        ]
+        commands.append(command)
+
+    if transition == "none":
+        commands.append(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
+                "-c",
+                "copy",
+                str(dest),
+            ]
+        )
+        return commands
+
+    inputs: list[str] = []
+    for segment in segment_paths:
+        inputs += ["-i", str(segment)]
+    if len(segment_paths) == 1:
+        commands.append(["ffmpeg", "-y", *inputs, "-c", "copy", str(dest)])
+        return commands
+    if durations is None or len(durations) != len(segment_paths):
+        raise ValueError("durations are required to build fade transitions.")
+    filters = []
+    previous = "[0:v]"
+    for index in range(1, len(segment_paths)):
+        offset = sum(durations[:index]) - index * transition_duration
+        label = f"[x{index}]"
+        filters.append(
+            f"{previous}[{index}:v]xfade=transition=fade:"
+            f"duration={transition_duration}:offset={round(offset, 6)}{label}"
+        )
+        previous = label
+    commands.append(
+        [
+            "ffmpeg",
+            "-y",
+            *inputs,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            previous,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+        ]
+    )
+    return commands
+
+
+@mcp.tool()
+def export_video(
+    scenes: list[str],
+    dest: str = "presentation.mp4",
+    folder: str = "slides",
+    workspace_dir: str | None = None,
+    fps: int = 30,
+    width: int | None = None,
+    height: int | None = None,
+    transition: str = "none",
+    transition_duration: float = 0.5,
+    image_duration: float = 2.0,
+    timeout: int = 600,
+) -> str:
+    """Concatenate slide media across scenes into a single MP4 video.
+
+    Reads the rendered slide configurations for ``scenes`` and stitches every
+    slide into one video with FFmpeg. Each slide is normalized to a common
+    frame size and rate (still images become fixed-duration segments) before
+    the segments are joined with the concat demuxer (``transition="none"``) or
+    an xfade crossfade chain (``transition="fade"``). Intermediates are
+    written to a temporary directory and cleaned up automatically.
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in order.
+        dest: Destination path for the exported video
+            (e.g., "presentation.mp4").
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        fps: Frame rate of the exported video. Defaults to 30.
+        width: Target frame width in pixels. Defaults to the first scene's
+            rendered resolution.
+        height: Target frame height in pixels. Defaults to the first scene's
+            rendered resolution.
+        transition: Segment transition: "none" (hard cuts) or "fade"
+            (crossfades). Defaults to "none".
+        transition_duration: Duration in seconds of each crossfade when
+            ``transition`` is "fade". Defaults to 0.5.
+        image_duration: Duration in seconds for still-image slides. Defaults
+            to 2.0.
+        timeout: Maximum time in seconds to wait for the export.
+
+    Returns:
+        A JSON string with the export status, destination path, exported
+        scenes, slide count, total duration, executed command, and captured
+        stdout/stderr.
+    """
+    if transition not in EXPORT_TRANSITIONS:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Invalid transition '{transition}'. "
+                    f"Valid transitions: {', '.join(EXPORT_TRANSITIONS)}."
+                ),
+            }
+        )
+    if fps < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"fps must be a positive integer, got {fps}.",
+            }
+        )
+    if image_duration <= 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"image_duration must be positive, got {image_duration}.",
+            }
+        )
+    if transition_duration < 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"transition_duration must be non-negative, "
+                    f"got {transition_duration}."
+                ),
+            }
+        )
+    if not scenes:
+        return json.dumps({"success": False, "error": "No scenes provided."})
+
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+
+    slides: list[dict] = []
+    first_resolution = None
+    for scene in scenes:
+        data = _load_scene_config(folder_path, scene)
+        if data is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Scene '{scene}' not found in {folder_path}.",
+                }
+            )
+        if first_resolution is None:
+            first_resolution = data.get("resolution")
+        for slide in data.get("slides", []):
+            slides.append(
+                {
+                    "path": _resolve_slide_media(cwd, slide),
+                    "type": slide.get("type"),
+                    "file": slide.get("file"),
+                }
+            )
+    if not slides:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"No slides found in scenes: {', '.join(scenes)}.",
+            }
+        )
+
+    missing = [
+        str(entry["path"] if entry["path"] is not None else entry["file"])
+        for entry in slides
+        if entry["path"] is None or not entry["path"].is_file()
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Slide media files not found: {', '.join(missing)}.",
+            }
+        )
+
+    if width is None or height is None:
+        if (
+            isinstance(first_resolution, (list, tuple))
+            and len(first_resolution) == 2
+            and all(isinstance(value, int) and value > 0 for value in first_resolution)
+        ):
+            width = width if width is not None else first_resolution[0]
+            height = height if height is not None else first_resolution[1]
+    if width is None or height is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Could not determine target width/height: pass them "
+                    "explicitly or render scenes with a valid 'resolution' entry."
+                ),
+            }
+        )
+    if width < 1 or height < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"width and height must be positive integers, "
+                    f"got {width}x{height}."
+                ),
+            }
+        )
+
+    ffmpeg = _ffmpeg_executable()
+    if ffmpeg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "ffmpeg executable not found. "
+                    "Install FFmpeg to export videos."
+                ),
+            }
+        )
+
+    destination = Path(cwd or ".").joinpath(dest).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    media = [
+        {"path": str(entry["path"]), "type": entry["type"]} for entry in slides
+    ]
+    deadline = time.monotonic() + timeout
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="manim_export_") as tmp:
+            workdir = Path(tmp)
+            segment_paths = [
+                str(workdir / f"segment_{index:03d}.mp4")
+                for index in range(len(media))
+            ]
+            concat_list_path = workdir / "concat.txt"
+            # Normalization is transition-independent; the fade offsets can
+            # only be computed once the segments exist and are measured.
+            commands = _build_export_command(
+                media=media,
+                dest=str(destination),
+                width=width,
+                height=height,
+                segment_paths=segment_paths,
+                fps=fps,
+                transition="none",
+                transition_duration=transition_duration,
+                image_duration=image_duration,
+                concat_list_path=str(concat_list_path),
+            )
+            concat_list_path.write_text(
+                _concat_list_text(segment_paths), encoding="utf-8"
+            )
+            for command in commands:
+                command[0] = ffmpeg
+            for command in commands[:-1]:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+                if result.stdout.strip():
+                    stdout_parts.append(result.stdout.strip())
+                if result.stderr.strip():
+                    stderr_parts.append(result.stderr.strip())
+                if result.returncode != 0:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                result.stderr.strip()
+                                or "Unknown video export error."
+                            ),
+                            "stdout": result.stdout.strip(),
+                            "stderr": result.stderr.strip(),
+                        },
+                        indent=2,
+                    )
+
+            durations = [_ffprobe_duration(segment) for segment in segment_paths]
+            if any(duration is None for duration in durations):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "Could not determine slide segment durations "
+                            "with ffprobe."
+                        ),
+                    }
+                )
+            if transition == "fade":
+                commands = _build_export_command(
+                    media=media,
+                    dest=str(destination),
+                    width=width,
+                    height=height,
+                    segment_paths=segment_paths,
+                    fps=fps,
+                    transition=transition,
+                    transition_duration=transition_duration,
+                    image_duration=image_duration,
+                    concat_list_path=str(concat_list_path),
+                    durations=durations,
+                )
+                commands[-1][0] = ffmpeg
+            command = commands[-1]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+            if result.stdout.strip():
+                stdout_parts.append(result.stdout.strip())
+            if result.stderr.strip():
+                stderr_parts.append(result.stderr.strip())
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            result.stderr.strip() or "Unknown video export error."
+                        ),
+                        "stdout": result.stdout.strip(),
+                        "stderr": result.stderr.strip(),
+                    },
+                    indent=2,
+                )
+        segment_durations = [duration for duration in durations if duration is not None]
+        if transition == "fade" and len(segment_durations) > 1:
+            total_duration = sum(segment_durations) - (
+                len(segment_durations) - 1
+            ) * transition_duration
+        else:
+            total_duration = sum(segment_durations)
+        return json.dumps(
+            {
+                "success": True,
+                "dest": str(destination),
+                "scenes": scenes,
+                "slide_count": len(slides),
+                "transition": transition,
+                "duration": round(total_duration, 3),
+                "command": command,
+                "stdout": "\n".join(stdout_parts),
+                "stderr": "\n".join(stderr_parts),
+            },
+            indent=2,
+        )
+    except subprocess.TimeoutExpired as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Video export timed out after {timeout}s: {e}",
+            }
+        )
+    except FileNotFoundError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"ffmpeg executable not found: {e}",
+            }
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Error executing export_video tool: {e}",
+            }
+        )
 
 
 MEDIA_EXTENSIONS = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg"}

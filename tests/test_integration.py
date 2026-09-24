@@ -23,6 +23,7 @@ ALL_TOOL_NAMES = {
     "execute_manim_code",
     "compile_presentation",
     "export_revealjs_html",
+    "export_video",
     "list_scenes",
     "preview_slide",
     "serve_revealjs_html",
@@ -105,6 +106,18 @@ async def test_call_preview_slide_missing_scene(mcp_client, tmp_path):
     """Verify preview_slide reports a missing scene over the transport."""
     result = await mcp_client.call_tool(
         "preview_slide", {"scene": "Nope", "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_export_video_missing_scene(mcp_client, tmp_path):
+    """Verify export_video returns clean failure JSON for a missing scene."""
+    result = await mcp_client.call_tool(
+        "export_video", {"scenes": ["Nope"], "workspace_dir": str(tmp_path)}
     )
     assert not result.is_error
     payload = json.loads(result.content[0].text)

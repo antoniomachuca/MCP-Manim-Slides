@@ -16,10 +16,13 @@ from mcp_manim_slides.server import (
     REVEAL_TRANSITIONS,
     RenderProgress,
     _build_convert_command,
+    _build_export_command,
     _build_render_command,
     _build_reveal_config,
     _build_revealjs_export_command,
+    _concat_list_text,
     _extract_missing_module,
+    _ffprobe_duration,
     _format_progress_message,
     _load_render_cache,
     _manim_slides_availability_error,
@@ -34,6 +37,7 @@ from mcp_manim_slides.server import (
     compile_presentation,
     execute_manim_code,
     export_revealjs_html,
+    export_video,
     hello_world,
     list_scenes,
     mcp,
@@ -1244,3 +1248,281 @@ async def test_prompt_missing_required_argument_raises():
     """Verify the SDK rejects a prompts/get call missing required arguments."""
     with pytest.raises(ValueError, match="Missing required arguments"):
         await mcp.get_prompt("title_slide", {})
+def test_build_export_command_transition_none():
+    """Verify transition=none builds normalize commands plus a concat list."""
+    commands = _build_export_command(
+        media=[
+            {"path": "slides/a.mp4", "type": "video"},
+            {"path": "slides/b.png", "type": "image"},
+        ],
+        dest="presentation.mp4",
+        width=854,
+        height=480,
+        segment_paths=["seg0.mp4", "seg1.mp4"],
+        fps=30,
+        transition="none",
+        image_duration=2.0,
+        concat_list_path="concat.txt",
+    )
+    assert len(commands) == 3
+    video_command, image_command, final_command = commands
+    assert "-loop" not in video_command
+    assert image_command[image_command.index("-loop") + 1] == "1"
+    assert image_command[image_command.index("-t") + 1] == "2.0"
+    for command in (video_command, image_command):
+        assert "-c:v" in command
+        assert "libx264" in command
+        assert "yuv420p" in command
+        video_filter = command[command.index("-vf") + 1]
+        assert "scale=854:480:force_original_aspect_ratio=decrease" in video_filter
+        assert "pad=854:480:(ow-iw)/2:(oh-ih)/2" in video_filter
+        assert "fps=30" in video_filter
+    assert final_command[final_command.index("-f") + 1] == "concat"
+    assert final_command[final_command.index("-i") + 1] == "concat.txt"
+    assert "xfade" not in "".join(final_command)
+    assert final_command[-1] == "presentation.mp4"
+
+
+def test_concat_list_text_lists_segments():
+    """Verify the concat demuxer list file references every segment."""
+    text = _concat_list_text(["seg0.mp4", "seg1.mp4"])
+    assert text == "file 'seg0.mp4'\nfile 'seg1.mp4'\n"
+
+
+def test_build_export_command_transition_fade():
+    """Verify transition=fade builds an xfade chain with measured offsets."""
+    commands = _build_export_command(
+        media=[
+            {"path": "slides/a.mp4", "type": "video"},
+            {"path": "slides/b.png", "type": "image"},
+            {"path": "slides/c.mp4", "type": "video"},
+        ],
+        dest="presentation.mp4",
+        width=640,
+        height=360,
+        segment_paths=["seg0.mp4", "seg1.mp4", "seg2.mp4"],
+        fps=30,
+        transition="fade",
+        transition_duration=0.5,
+        image_duration=2.0,
+        concat_list_path="concat.txt",
+        durations=[2.0, 3.0, 1.5],
+    )
+    assert len(commands) == 4
+    image_command = commands[1]
+    assert image_command[image_command.index("-loop") + 1] == "1"
+    final_command = commands[-1]
+    filter_arg = final_command[final_command.index("-filter_complex") + 1]
+    assert "xfade=transition=fade" in filter_arg
+    assert "duration=0.5" in filter_arg
+    assert "offset=1.5" in filter_arg
+    assert "offset=4.0" in filter_arg
+    assert final_command[final_command.index("-map") + 1] == "[x2]"
+    assert "concat" not in "".join(final_command)
+    assert final_command[-1] == "presentation.mp4"
+
+
+def test_ffprobe_duration_parses_stdout(monkeypatch):
+    """Verify _ffprobe_duration parses the ffprobe duration output."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="2.5\n"),
+    )
+    assert _ffprobe_duration("clip.mp4") == 2.5
+
+
+def test_ffprobe_duration_returns_none_on_failure(monkeypatch):
+    """Verify _ffprobe_duration returns None when the probe fails."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(1, stderr="boom"),
+    )
+    assert _ffprobe_duration("clip.mp4") is None
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="N/A"),
+    )
+    assert _ffprobe_duration("clip.mp4") is None
+
+    def missing_ffprobe(*args, **kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(subprocess, "run", missing_ffprobe)
+    assert _ffprobe_duration("clip.mp4") is None
+
+
+def test_export_video_success(monkeypatch, tmp_path):
+    """Verify export_video assembles the segments into one MP4."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [
+            {"type": "video", "file": "slides/files/Intro/0.mp4"},
+            {"type": "image", "file": "slides/files/Intro/1.png"},
+        ],
+    )
+    _write_scene_config(
+        tmp_path,
+        "Outro",
+        [{"type": "video", "file": "slides/files/Outro/0.mp4"}],
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append(list(command))
+        if command[0] == "ffprobe":
+            return _FakeCompletedProcess(0, stdout="2.0\n")
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+
+    result = json.loads(
+        export_video(
+            scenes=["Intro", "Outro"],
+            dest="presentation.mp4",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is True
+    assert result["dest"] == str((tmp_path / "presentation.mp4").resolve())
+    assert result["scenes"] == ["Intro", "Outro"]
+    assert result["slide_count"] == 3
+    assert result["transition"] == "none"
+    assert result["duration"] == 6.0
+    assert result["command"][0] == "/usr/bin/ffmpeg"
+    ffmpeg_commands = [c for c in captured if c[0] != "ffprobe"]
+    final_command = ffmpeg_commands[-1]
+    assert final_command[final_command.index("-f") + 1] == "concat"
+    normalize_commands = ffmpeg_commands[:-1]
+    assert [Path(c[-1]).name for c in normalize_commands] == [
+        "segment_000.mp4",
+        "segment_001.mp4",
+        "segment_002.mp4",
+    ]
+    assert any("-loop" in c for c in normalize_commands)
+
+
+def test_export_video_fade_builds_xfade_offsets(monkeypatch, tmp_path):
+    """Verify export_video measures segments and chains xfades with offsets."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [
+            {"type": "video", "file": "slides/files/Intro/0.mp4"},
+            {"type": "video", "file": "slides/files/Intro/1.mp4"},
+        ],
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append(list(command))
+        if command[0] == "ffprobe":
+            return _FakeCompletedProcess(0, stdout="2.0\n")
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+
+    result = json.loads(
+        export_video(
+            scenes=["Intro"],
+            dest="presentation.mp4",
+            workspace_dir=str(tmp_path),
+            transition="fade",
+            transition_duration=0.5,
+        )
+    )
+    assert result["success"] is True
+    assert result["transition"] == "fade"
+    assert result["duration"] == 3.5
+    final_command = [c for c in captured if c[0] != "ffprobe"][-1]
+    filter_arg = final_command[final_command.index("-filter_complex") + 1]
+    assert "xfade=transition=fade" in filter_arg
+    assert "offset=1.5" in filter_arg
+    assert final_command[final_command.index("-map") + 1] == "[x1]"
+
+
+def test_export_video_missing_media(tmp_path):
+    """Verify export_video lists every missing slide media file."""
+    slides_dir = tmp_path / "slides"
+    slides_dir.mkdir()
+    (slides_dir / "Intro.json").write_text(
+        json.dumps(
+            {
+                "slides": [
+                    {"type": "video", "file": "slides/files/Intro/0.mp4"},
+                    {"type": "image", "file": "slides/files/Intro/1.png"},
+                ],
+                "resolution": [854, 480],
+            }
+        )
+    )
+    result = json.loads(export_video(scenes=["Intro"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+    assert "slides/files/Intro/0.mp4" in result["error"]
+    assert "slides/files/Intro/1.png" in result["error"]
+
+
+def test_export_video_missing_scene(tmp_path):
+    """Verify export_video reports a missing scene before invoking ffmpeg."""
+    result = json.loads(export_video(scenes=["Nope"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_export_video_invalid_transition(tmp_path):
+    """Verify export_video rejects unsupported transitions."""
+    result = json.loads(
+        export_video(
+            scenes=["Intro"],
+            transition="wipe",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert "Invalid transition 'wipe'" in result["error"]
+
+
+def test_export_video_missing_ffmpeg(monkeypatch, tmp_path):
+    """Verify export_video fails fast with an actionable ffmpeg error."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [{"type": "video", "file": "slides/files/Intro/0.mp4"}],
+    )
+    monkeypatch.setattr("mcp_manim_slides.server._ffmpeg_executable", lambda: None)
+    result = json.loads(export_video(scenes=["Intro"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "ffmpeg executable not found" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_export_video():
+    """Verify export_video tool is registered on the MCPServer."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "export_video" in tool_names
+
+    export_tool = next(t for t in tools if t.name == "export_video")
+    assert "MP4" in export_tool.description
+    assert "scenes" in export_tool.input_schema["properties"]
+    assert "transition" in export_tool.input_schema["properties"]
+    assert "image_duration" in export_tool.input_schema["properties"]
