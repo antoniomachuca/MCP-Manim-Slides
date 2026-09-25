@@ -10,33 +10,26 @@
 
 
 </div>
-A robust Model Context Protocol (MCP) server that empowers AI agents to generate, orchestrate, and compile interactive presentations with manim-slides.
-
-## Overview
-
-While traditional AI coding assistants can write Manim code, executing that code and structuring it into a readable presentation format has remained a manual process. This MCP server bridges the gap by providing AI clients (like Claude Desktop, Cursor, or Antigravity) with direct tools to:
-
-1. **Execute Manim Scripts**: Dynamically run generated Manim code safely.
-2. **Handle Slides Orchestration**: Natively support the `Slide` class for presentation logic.
-3. **Compile Presentations**: Convert rendered animations into interactive HTML presentations (Reveal.js) directly from the AI prompt.
+MCP server that lets an agent write Manim-Slides scenes, render them, and compile the deck from the same session.
 
 ## Demo
+
+A Claude Desktop session asks for a short Pythagorean theorem deck. The view zooms into the prompt as it is typed, then pulls back as the agent calls `math_derivation`, `execute_manim_code`, and `sync_deck`. `serve_revealjs_html` opens the browser on the rendered Manim deck and plays the animations.
 
 ![Manim-Slides MCP Demo](assets/demo.gif)
 
 ## Features
 
-- **Direct Code Execution**: Send Python code containing Manim `Slide` classes; the server handles temporary file creation, execution, and cleanup.
-- **Error Feedback Loop**: Captures standard output and runtime exceptions, feeding them back to the AI for autonomous debugging.
-- **Live Render Progress**: Streams rendered-frame percentage updates to the client via `notifications/progress`.
-- **Slide-Archetype Prompt Templates**: Built-in MCP prompts (`title_slide`, `agenda`, `code_walkthrough`, `math_derivation`, `two_column_comparison`) that turn a few arguments into detailed instructions for writing well-laid-out Manim-Slides code.
-- **Per-Scene Render Caching**: Content-hashes each scene class (preamble + class source + quality) so editing one scene never re-renders its siblings, reusing previously rendered media from `.render_cache`.
-- **Incremental Deck Sync**: `sync_deck` renders only new or changed scenes, restores the rest from cache, reports removed scenes, and recompiles the deck in one call.
-- **HTML/Reveal.js Export**: Seamlessly compiles the generated video assets into a fully functional interactive web presentation.
-- **Single-MP4 Export**: `export_video` stitches all slide media into one MP4 via FFmpeg, with optional crossfade transitions and fixed-duration handling for still-image slides.
-- **Deck Screenshots & Contact Sheets**: `screenshot_deck` captures every slide headlessly (optional Playwright `vision` extra) so the AI can see its own deck, and `contact_sheet` montages slide frames into a single grid image using FFmpeg only.
-- **One-Click Browser Preview**: Serves the exported Reveal.js HTML on an ephemeral local HTTP server so it can be opened in a browser with a single call.
-- **State Management**: Persists generated media in structured workspace directories for easy access.
+- `execute_manim_code` writes the script, runs `manim-slides render`, and returns the media paths. Syntax errors fail before a subprocess starts. stdout, stderr, and tracebacks go back to the client.
+- Render progress is reported with `notifications/progress` as frames complete.
+- Each scene is cached by a hash of the shared preamble, the class source, and the quality flag. Changing one scene leaves the others in `.render_cache`.
+- `sync_deck` renders new or changed scenes, restores the rest from cache, reports removed scenes, and runs `manim-slides convert` in the same call.
+- Prompt templates `title_slide`, `agenda`, `code_walkthrough`, `math_derivation`, and `two_column_comparison` expand a few arguments into layout and code instructions.
+- `compile_presentation` and `export_revealjs_html` build Reveal.js HTML, PDF, PPTX, or a zip, including theme, transition, and offline options.
+- `export_video` joins slide media into one MP4. Still images get a fixed duration. `transition` is `none` or a crossfade.
+- `preview_slide` extracts one slide as an image, a short MP4, or a GIF. `contact_sheet` montages one frame per slide with FFmpeg. `screenshot_deck` captures a Reveal.js deck headlessly (optional `vision` extra).
+- `serve_revealjs_html` hosts the deck on a local port. `stop_preview_server` shuts that server down.
+- `list_scenes` and the `slides://list` resource read rendered scene metadata from the workspace.
 
 ## Prerequisites
 
