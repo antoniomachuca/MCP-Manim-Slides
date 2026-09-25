@@ -25,9 +25,11 @@ ALL_TOOL_NAMES = {
     "compile_presentation",
     "export_revealjs_html",
     "export_video",
+    "apply_deck_layout",
     "list_scenes",
     "preview_slide",
     "serve_revealjs_html",
+    "serve_deck_editor",
     "stop_preview_server",
     "screenshot_deck",
     "contact_sheet",
@@ -214,6 +216,27 @@ async def test_call_screenshot_deck_missing_deck(mcp_client, tmp_path):
     """Verify screenshot_deck reports a missing deck before touching a browser."""
     result = await mcp_client.call_tool(
         "screenshot_deck", {"dest": "nope.html", "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_apply_deck_layout_missing_layout(mcp_client, tmp_path):
+    """Verify apply_deck_layout reports a missing layout over the transport."""
+    (tmp_path / "deck.html").write_text(
+        "<html><body><section>a</section></body></html>"
+    )
+
+    result = await mcp_client.call_tool(
+        "apply_deck_layout",
+        {
+            "dest": "deck.html",
+            "layout_path": "missing.json",
+            "workspace_dir": str(tmp_path),
+        },
     )
     assert not result.is_error
     payload = json.loads(result.content[0].text)

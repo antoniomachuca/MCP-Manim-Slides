@@ -27,6 +27,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from html import escape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -619,28 +620,55 @@ _PREVIEW_SERVERS: dict[str, ThreadingHTTPServer] = {}
 _PREVIEW_SERVERS_LOCK = threading.Lock()
 
 
-def _preview_server_key(directory: Path) -> str:
-    """Return the registry key for a served directory."""
-    return str(directory.resolve())
+def _preview_server_key(directory: Path, kind: str = "static") -> str:
+    """Return the registry key for a served directory and handler kind.
+
+    Args:
+        directory: Directory being served.
+        kind: Handler flavour ("static" for plain file serving, "editor:..." for
+            the deck editor). Distinct kinds never share a server instance.
+
+    Returns:
+        The registry key string.
+    """
+    return f"{directory.resolve()}|{kind}"
 
 
 def _start_preview_server(
     directory: Path,
     host: str,
     port: int | None,
+    handler_factory: Callable[..., SimpleHTTPRequestHandler] | None = None,
+    kind: str = "static",
 ) -> tuple[ThreadingHTTPServer, int, bool]:
     """Start a background HTTP server for ``directory``, or reuse an existing one.
 
     The server runs in a daemon thread for the lifetime of the MCP process.
     When ``port`` is None, an ephemeral OS-assigned port is used. Returns the
     server instance, the bound port, and whether an existing server was reused.
+
+    Args:
+        directory: Directory the handler serves files from.
+        host: Bind address for the server.
+        port: Port to bind, or None for an ephemeral OS-assigned port.
+        handler_factory: Optional request handler class (or partial) replacing
+            ``SimpleHTTPRequestHandler``. It is always invoked with a
+            ``directory`` keyword argument. Defaults to plain static serving,
+            which keeps ``serve_revealjs_html`` behavior unchanged.
+        kind: Registry flavour so servers with different handlers or decks are
+            never shared (see ``_preview_server_key``).
+
+    Returns:
+        A tuple of the server instance, the bound port, and a flag that is
+        True when an existing server was reused.
     """
-    key = _preview_server_key(directory)
+    key = _preview_server_key(directory, kind)
     with _PREVIEW_SERVERS_LOCK:
         existing = _PREVIEW_SERVERS.get(key)
         if existing is not None:
             return existing, existing.server_address[1], True
-        handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
+        factory = handler_factory or SimpleHTTPRequestHandler
+        handler = partial(factory, directory=str(directory))
         server = ThreadingHTTPServer((host, port or 0), handler)
         server.daemon_threads = True
         _PREVIEW_SERVERS[key] = server
@@ -781,6 +809,709 @@ def stop_preview_server(port: int | None = None) -> str:
             "success": True,
             "stopped_ports": stopped,
             "remaining": len(_PREVIEW_SERVERS),
+        },
+        indent=2,
+    )
+
+
+_EDITOR_SCRIPT_NAME = "editor.js"
+_EDITOR_LAYOUT_NAME = "deck_layout.json"
+
+_EDITOR_INLINE_CSS = (
+    '<style id="__deck-editor-css">'
+    "#deck-editor{position:fixed;top:0;left:0;right:0;z-index:2147483000;"
+    "display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px 10px;"
+    "background:rgba(18,18,18,.94);color:#eee;font:13px/1.4 system-ui,sans-serif}"
+    "#deck-editor button,#deck-editor select,#deck-editor input{font:inherit}"
+    "#deck-status{opacity:.85}"
+    "#deck-slide-panel{position:fixed;top:52px;right:8px;z-index:2147483000;"
+    "width:216px;max-height:70vh;overflow:auto;padding:8px;border-radius:6px;"
+    "background:rgba(18,18,18,.94);color:#eee;font:12px/1.4 system-ui,sans-serif}"
+    ".deck-slide-row{display:flex;gap:6px;align-items:center;padding:3px 4px;"
+    "border-radius:4px;cursor:grab}"
+    ".deck-slide-row.deck-hidden{opacity:.45}"
+    ".deck-slide-count{opacity:.7;min-width:1.2em;text-align:center}"
+    ".deck-overlay{position:absolute;box-sizing:border-box;cursor:move}"
+    ".deck-overlay-body{width:100%;height:100%;box-sizing:border-box;"
+    "overflow:hidden;object-fit:contain;outline:0}"
+    ".deck-overlay.deck-selected{outline:2px solid #4da3ff}"
+    ".deck-handle{display:none;position:absolute;width:10px;height:10px;"
+    "background:#4da3ff;border-radius:2px}"
+    ".deck-selected>.deck-handle{display:block}"
+    '.deck-handle[data-corner="nw"]{left:-5px;top:-5px;cursor:nwse-resize}'
+    '.deck-handle[data-corner="ne"]{right:-5px;top:-5px;cursor:nesw-resize}'
+    '.deck-handle[data-corner="sw"]{left:-5px;bottom:-5px;cursor:nesw-resize}'
+    '.deck-handle[data-corner="se"]{right:-5px;bottom:-5px;cursor:nwse-resize}'
+    "</style>"
+)
+
+
+def _editor_js_path() -> Path:
+    """Return the path to the bundled ``editor.js`` package asset."""
+    return Path(__file__).with_name(_EDITOR_SCRIPT_NAME)
+
+
+def _inject_editor_assets(html: str) -> str:
+    """Inject the editor stylesheet and script tag before ``</body>``.
+
+    Args:
+        html: The exported deck HTML document.
+
+    Returns:
+        The document with a ``<style>`` block and
+        ``<script src="/__editor.js"></script>`` inserted before the closing
+        ``</body>`` tag, or appended when the tag is missing.
+    """
+    snippet = f'{_EDITOR_INLINE_CSS}\n<script src="/__editor.js"></script>'
+    match = re.search(r"</body\s*>", html, re.IGNORECASE)
+    if match is None:
+        return f"{html}\n{snippet}\n"
+    return f"{html[: match.start()]}\n{snippet}\n{html[match.start() :]}"
+
+
+class _EditorRequestHandler(SimpleHTTPRequestHandler):
+    """Serve a deck workspace with the in-browser editor injected.
+
+    The deck HTML is rewritten on the fly with an editor ``<script>`` tag and
+    inline CSS before ``</body>``. ``GET /__editor.js`` serves the bundled
+    editor asset (``application/javascript``), ``GET /__layout`` returns the
+    saved ``deck_layout.json`` (or ``{}`` when absent), and ``POST /__layout``
+    validates and saves a layout. Every other request behaves like
+    ``SimpleHTTPRequestHandler`` over the served directory.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        deck_path: str,
+        layout_path: str,
+        editor_js_path: str,
+        **kwargs: object,
+    ) -> None:
+        self.deck_path = Path(deck_path)
+        self.layout_path = Path(layout_path)
+        self.editor_js_path = Path(editor_js_path)
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self) -> None:
+        """Serve the editor asset, the layout JSON, or the injected deck."""
+        path = self.path.split("?", 1)[0]
+        if path == "/__editor.js":
+            self._send_file(self.editor_js_path, "application/javascript")
+            return
+        if path == "/__layout":
+            self._send_bytes(200, self._layout_bytes(), "application/json")
+            return
+        if self._is_deck_request():
+            try:
+                deck_html = self.deck_path.read_text(encoding="utf-8")
+            except OSError as e:
+                self._send_json(500, {"success": False, "error": str(e)})
+                return
+            body = _inject_editor_assets(deck_html).encode("utf-8")
+            self._send_bytes(200, body, "text/html; charset=utf-8")
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:
+        """Save a posted deck layout after JSON and version validation."""
+        path = self.path.split("?", 1)[0]
+        if path != "/__layout":
+            self._send_json(
+                404, {"success": False, "error": f"Unknown endpoint: {path}"}
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as e:
+            self._send_json(400, {"success": False, "error": f"Invalid JSON body: {e}"})
+            return
+        if not isinstance(payload, dict) or "version" not in payload:
+            self._send_json(
+                400,
+                {
+                    "success": False,
+                    "error": "Layout JSON must be an object with a 'version' field.",
+                },
+            )
+            return
+        try:
+            self.layout_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as e:
+            self._send_json(
+                400, {"success": False, "error": f"Failed to save layout: {e}"}
+            )
+            return
+        self._send_json(200, {"success": True})
+
+    def _is_deck_request(self) -> bool:
+        """Return True when the request targets the served deck HTML file."""
+        try:
+            requested = Path(self.translate_path(self.path))
+        except (OSError, ValueError):
+            return False
+        return requested.resolve() == self.deck_path.resolve()
+
+    def _layout_bytes(self) -> bytes:
+        """Return the saved layout JSON bytes, or ``{}`` when none exists."""
+        try:
+            return self.layout_path.read_bytes()
+        except OSError:
+            return b"{}"
+
+    def _send_file(self, path: Path, content_type: str) -> None:
+        """Send ``path`` with ``content_type``, or a 500 error envelope."""
+        try:
+            self._send_bytes(200, path.read_bytes(), content_type)
+        except OSError as e:
+            self._send_json(500, {"success": False, "error": str(e)})
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        """Send ``payload`` serialized as a JSON response body."""
+        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(status, body, "application/json")
+
+    def _send_bytes(self, status: int, data: bytes, content_type: str) -> None:
+        """Send a raw response body with the given status and content type."""
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _resolve_workspace(workspace_dir: str | None) -> Path:
+    """Resolve the workspace root used for deck and layout files.
+
+    Args:
+        workspace_dir: Explicit workspace directory, or None to fall back to
+            the ``WORKSPACE_DIR`` environment variable and then the current
+            directory.
+
+    Returns:
+        The absolute workspace path.
+    """
+    return Path(workspace_dir or os.environ.get("WORKSPACE_DIR") or ".").resolve()
+
+
+def _resolve_deck_path(dest: str, workspace: Path) -> Path:
+    """Resolve a deck path against the workspace when it is relative.
+
+    Args:
+        dest: Destination path (absolute, or relative to ``workspace``).
+        workspace: Resolved workspace root.
+
+    Returns:
+        The absolute deck path.
+    """
+    dest_path = Path(dest)
+    if not dest_path.is_absolute():
+        dest_path = (workspace / dest_path).resolve()
+    return dest_path
+
+
+@mcp.tool()
+def serve_deck_editor(
+    dest: str,
+    workspace_dir: str | None = None,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    open_browser: bool = True,
+) -> str:
+    """Serve an exported Reveal.js deck with an in-browser visual deck editor.
+
+    Starts a background HTTP server over the workspace (so relative slide
+    assets resolve) and injects a vanilla-JS editor into the served deck HTML:
+    drag/resize text and image overlays per slide, z-order up/down
+    ("subir/bajar capas"), slide hide/unhide and drag-to-reorder, live Reveal
+    theme switching, and a save button that persists to ``deck_layout.json``.
+    Baked output can be produced afterwards with ``apply_deck_layout``.
+
+    Endpoints served alongside the deck: ``GET /__editor.js`` (editor asset),
+    ``GET /__layout`` (saved layout or ``{}``), and ``POST /__layout``
+    (validate and save; requires a JSON object with a ``version`` field).
+
+    The layout JSON persisted by the editor (schema version 1) is::
+
+        {"version": 1, "theme": "black",
+         "slides": [{"index": 0, "order": 0, "hidden": false,
+           "overlays": [
+             {"id": "o1", "type": "text", "x": 10.0, "y": 20.0,
+              "w": 40.0, "h": 15.0, "z": 0, "text": "Hello",
+              "src": null, "color": "#ffffff", "font_size": 32.0},
+             {"id": "o2", "type": "image", "x": 60.0, "y": 10.0,
+              "w": 30.0, "h": 40.0, "z": 1, "text": null,
+              "src": "https://example.com/img.png",
+              "color": null, "font_size": null}]}]}
+
+    ``index`` identifies the slide's section in the source deck (position
+    among top-level ``<section>`` blocks), ``order`` is the target slide
+    position, and ``x``/``y``/``w``/``h`` are percentages (float 0-100) of
+    the slide box. ``z`` is stacking order (lower renders behind); ``text``
+    overlays use ``text``/``color``/``font_size`` while ``image`` overlays use
+    ``src``.
+
+    Args:
+        dest: Path to the exported HTML deck (e.g., "presentation.html").
+            Resolved relative to ``workspace_dir`` when not absolute.
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory. The layout is
+            saved as ``<workspace>/deck_layout.json``.
+        host: Bind address for the server (default "127.0.0.1").
+        port: Port to bind. When None, an ephemeral OS-assigned port is used.
+        open_browser: When True, attempt to open the URL in the default browser.
+
+    Returns:
+        A JSON string with the editor URL, bound port, served directory, the
+        absolute ``layout_file`` path, whether a server was reused, and
+        ``"editor": true``.
+    """
+    workspace = _resolve_workspace(workspace_dir)
+    dest_path = _resolve_deck_path(dest, workspace)
+
+    if not dest_path.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"HTML deck not found: {dest_path}",
+            }
+        )
+    if dest_path.suffix.lower() != ".html":
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Expected an .html file, got: {dest_path}",
+            }
+        )
+    editor_js = _editor_js_path()
+    if not editor_js.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Editor asset not found: {editor_js}",
+            }
+        )
+
+    try:
+        url_path = dest_path.relative_to(workspace).as_posix()
+        serve_dir = workspace
+    except ValueError:
+        url_path = dest_path.name
+        serve_dir = dest_path.parent
+
+    layout_file = workspace / _EDITOR_LAYOUT_NAME
+    handler_factory = partial(
+        _EditorRequestHandler,
+        deck_path=str(dest_path),
+        layout_path=str(layout_file),
+        editor_js_path=str(editor_js),
+    )
+    try:
+        server, bound_port, reused = _start_preview_server(
+            serve_dir,
+            host,
+            port,
+            handler_factory=handler_factory,
+            kind=f"editor:{url_path}",
+        )
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to start preview server: {e}",
+            }
+        )
+
+    url = f"http://{host}:{bound_port}/{url_path}"
+
+    browser_opened = False
+    if open_browser:
+        try:
+            browser_opened = bool(webbrowser.open(url))
+        except Exception:
+            browser_opened = False
+
+    return json.dumps(
+        {
+            "success": True,
+            "url": url,
+            "host": host,
+            "port": bound_port,
+            "directory": str(serve_dir.resolve()),
+            "file": url_path,
+            "reused": reused,
+            "browser_opened": browser_opened,
+            "editor": True,
+            "layout_file": str(layout_file),
+        },
+        indent=2,
+    )
+
+
+def _load_deck_layout(layout_path: Path) -> tuple[dict | None, str | None]:
+    """Load and minimally validate a deck layout JSON file.
+
+    Args:
+        layout_path: Path to the layout JSON file.
+
+    Returns:
+        A tuple of the parsed layout (or None on failure) and an error message
+        (or None on success). A valid layout is a JSON object with a
+        ``version`` field.
+    """
+    if not layout_path.is_file():
+        return None, f"Layout file not found: {layout_path}"
+    try:
+        data = json.loads(layout_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"Invalid layout file {layout_path}: {e}"
+    if not isinstance(data, dict):
+        return None, "Layout JSON must be an object with a 'version' field."
+    if "version" not in data:
+        return None, "Layout JSON must include a 'version' field."
+    return data, None
+
+
+def _as_float(value: object, default: float) -> float:
+    """Coerce ``value`` to float, falling back to ``default``."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+_SECTION_OPEN_RE = re.compile(r"<section\b", re.IGNORECASE)
+_SECTION_CLOSE_RE = re.compile(r"</section\s*>", re.IGNORECASE)
+_THEME_LINK_RE = re.compile(
+    r"""(<link\b[^>]*href=["'][^"']*/theme/)[^"']*\.css(["'])""",
+    re.IGNORECASE,
+)
+
+
+def _split_sections(html: str) -> tuple[str, list[str], str]:
+    """Split a deck document into prefix, top-level sections, and suffix.
+
+    Top-level ``<section>`` blocks are located by scanning ``<section`` and
+    ``</section>`` tags with nesting-aware depth counting. String scanning is
+    used instead of ``html.parser`` because a parser cannot round-trip the
+    document; this keeps markup inside slides byte-for-byte intact. Each
+    returned section includes the whitespace that followed it in the source,
+    so formatting travels with its slide. Caveat: ``<section`` text inside
+    ``<script>``/``<style>``/comments or a ``>`` inside a quoted section-tag
+    attribute would confuse the scanner; exported manim-slides decks contain
+    neither.
+
+    Args:
+        html: Full HTML document text.
+
+    Returns:
+        A tuple of the document prefix, the top-level section blocks in source
+        order, and the document suffix. ``blocks`` is empty when the document
+        contains no ``<section>`` blocks.
+    """
+    tokens: list[tuple[int, int, bool]] = []
+    for match in _SECTION_OPEN_RE.finditer(html):
+        tokens.append((match.start(), match.end(), True))
+    for match in _SECTION_CLOSE_RE.finditer(html):
+        tokens.append((match.start(), match.end(), False))
+    tokens.sort(key=lambda token: token[0])
+
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    open_at = 0
+    for start, end, is_open in tokens:
+        if is_open:
+            if depth == 0:
+                open_at = start
+            depth += 1
+        elif depth > 0:
+            depth -= 1
+            if depth == 0:
+                spans.append((open_at, end))
+
+    if not spans:
+        return html, [], ""
+
+    prefix = html[: spans[0][0]]
+    suffix = html[spans[-1][1] :]
+    blocks: list[str] = []
+    for position, (start, end) in enumerate(spans):
+        gap_end = spans[position + 1][0] if position + 1 < len(spans) else end
+        blocks.append(html[start:gap_end])
+    return prefix, blocks, suffix
+
+
+def _render_overlay_div(overlay: dict) -> str:
+    """Render one layout overlay as an absolutely-positioned HTML fragment.
+
+    Args:
+        overlay: Overlay entry from the layout JSON. ``x``/``y``/``w``/``h``
+            are percentages of the slide box; ``type`` is "text" or "image".
+
+    Returns:
+        A ``<div data-overlay-id=...>`` with percent-based inline styles and
+        an inner text ``<div>`` or image ``<img>``.
+    """
+    x = round(_as_float(overlay.get("x"), 0.0), 4)
+    y = round(_as_float(overlay.get("y"), 0.0), 4)
+    w = round(_as_float(overlay.get("w"), 0.0), 4)
+    h = round(_as_float(overlay.get("h"), 0.0), 4)
+    z = int(_as_float(overlay.get("z"), 0.0))
+    overlay_id = escape(str(overlay.get("id") or ""), quote=True)
+    style = (
+        f"position:absolute;left:{x:g}%;top:{y:g}%;"
+        f"width:{w:g}%;height:{h:g}%;z-index:{z};"
+    )
+    if overlay.get("type") == "image":
+        src = escape(str(overlay.get("src") or ""), quote=True)
+        inner = (
+            f'<img src="{src}" alt="" '
+            'style="width:100%;height:100%;object-fit:contain;"/>'
+        )
+    else:
+        text = escape(str(overlay.get("text") or ""))
+        color = escape(str(overlay.get("color") or "#ffffff"), quote=True)
+        font_size = round(_as_float(overlay.get("font_size"), 32.0), 4)
+        inner = (
+            f'<div style="width:100%;height:100%;overflow:hidden;'
+            f'font-size:{font_size:g}px;color:{color};">{text}</div>'
+        )
+    return (
+        f'<div class="deck-overlay" data-overlay-id="{overlay_id}" '
+        f'style="{style}">{inner}</div>'
+    )
+
+
+def _inject_overlays(section: str, overlays: list[dict]) -> tuple[str, int]:
+    """Insert overlay markup right after the section's opening tag.
+
+    Args:
+        section: A full top-level ``<section>`` block.
+        overlays: Overlay entries from the layout, in any order.
+
+    Returns:
+        A tuple of the rewritten section block and the number of injected
+        overlay divs. Overlays are emitted sorted by ``z`` (ascending) so DOM
+        order matches stacking order.
+    """
+    ordered = sorted(overlays, key=lambda item: _as_float(item.get("z"), 0.0))
+    if not ordered:
+        return section, 0
+    markup = "".join(_render_overlay_div(item) for item in ordered)
+    tag_end = section.find(">")
+    if tag_end == -1:
+        return section + markup, len(ordered)
+    return section[: tag_end + 1] + markup + section[tag_end + 1 :], len(ordered)
+
+
+def _swap_theme_link(html: str, theme: str) -> str:
+    """Point the first linked Reveal theme stylesheet at ``theme``.
+
+    Args:
+        html: Full HTML document text.
+        theme: Reveal theme name.
+
+    Returns:
+        The document with the theme href updated, or unchanged when ``theme``
+        is not a known Reveal theme or no ``/theme/*.css`` link exists.
+    """
+    if theme not in REVEAL_THEMES:
+        return html
+    return _THEME_LINK_RE.sub(rf"\g<1>{theme}.css\g<2>", html, count=1)
+
+
+@mcp.tool()
+def apply_deck_layout(
+    dest: str,
+    layout_path: str = "deck_layout.json",
+    workspace_dir: str | None = None,
+    out: str | None = None,
+) -> str:
+    """Bake a saved deck layout into an exported Reveal.js HTML deck.
+
+    Reorders top-level ``<section>`` blocks per each slide's ``order``, drops
+    sections marked ``hidden``, and injects absolutely-positioned overlay
+    markup (percent-based ``left``/``top``/``width``/``height``) inside every
+    remaining section. When the layout ``theme`` is a known Reveal theme and
+    the deck links a Reveal theme stylesheet, its href is updated too.
+    Sections not referenced by the layout are appended at the end in source
+    order.
+
+    The layout JSON persisted by the editor (schema version 1) is::
+
+        {"version": 1, "theme": "black",
+         "slides": [{"index": 0, "order": 0, "hidden": false,
+           "overlays": [
+             {"id": "o1", "type": "text", "x": 10.0, "y": 20.0,
+              "w": 40.0, "h": 15.0, "z": 0, "text": "Hello",
+              "src": null, "color": "#ffffff", "font_size": 32.0},
+             {"id": "o2", "type": "image", "x": 60.0, "y": 10.0,
+              "w": 30.0, "h": 40.0, "z": 1, "text": null,
+              "src": "https://example.com/img.png",
+              "color": null, "font_size": null}]}]}
+
+    ``index`` identifies the slide's section in the source deck (position
+    among top-level ``<section>`` blocks), ``order`` is the target slide
+    position, and ``x``/``y``/``w``/``h`` are percentages (float 0-100) of
+    the slide box. ``z`` is stacking order (lower renders behind); ``text``
+    overlays use ``text``/``color``/``font_size`` while ``image`` overlays use
+    ``src``.
+
+    Sections are located with nesting-aware string scanning of ``<section`` /
+    ``</section>`` tags (stdlib ``html.parser`` cannot round-trip the
+    document, so markup inside slides is preserved byte-for-byte). Caveat:
+    ``<section`` text inside ``<script>``/``<style>``/comments would confuse
+    the scanner; exported manim-slides decks do not contain those. Apply the
+    layout to the *original* export: baking twice maps ``index`` values onto
+    an already-reordered document.
+
+    Args:
+        dest: Path to the exported HTML deck (e.g., "presentation.html").
+            Resolved relative to ``workspace_dir`` when not absolute.
+        layout_path: Path to the layout JSON written by the editor
+            (default "deck_layout.json", resolved inside ``workspace_dir``).
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        out: Output path for the baked deck. When None, ``dest`` is
+            overwritten in place.
+
+    Returns:
+        A JSON string with the absolute output path, the number of sections
+        in the output document, how many hidden sections were removed, and
+        how many overlays were injected.
+    """
+    workspace = _resolve_workspace(workspace_dir)
+    dest_path = _resolve_deck_path(dest, workspace)
+
+    if not dest_path.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"HTML deck not found: {dest_path}",
+            }
+        )
+    if dest_path.suffix.lower() != ".html":
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Expected an .html file, got: {dest_path}",
+            }
+        )
+    layout_file = Path(layout_path)
+    if not layout_file.is_absolute():
+        layout_file = workspace / layout_file
+    layout, error = _load_deck_layout(layout_file)
+    if error is not None:
+        return json.dumps({"success": False, "error": error})
+
+    slides = layout.get("slides", [])
+    if not isinstance(slides, list):
+        return json.dumps(
+            {"success": False, "error": "Layout 'slides' must be a list."}
+        )
+    for position, slide in enumerate(slides):
+        if not isinstance(slide, dict):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Layout slide {position} must be an object.",
+                }
+            )
+        index = slide.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Layout slide {position} needs an integer 'index'.",
+                }
+            )
+        overlays = slide.get("overlays", [])
+        if not isinstance(overlays, list) or not all(
+            isinstance(item, dict) for item in overlays
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Layout slide {position} 'overlays' must be a "
+                        "list of objects."
+                    ),
+                }
+            )
+
+    try:
+        source = dest_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return json.dumps({"success": False, "error": f"Cannot read deck: {e}"})
+
+    prefix, blocks, suffix = _split_sections(source)
+    if not blocks:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"No <section> blocks found in: {dest_path}",
+            }
+        )
+
+    indices = [slide["index"] for slide in slides]
+    if len(set(indices)) != len(indices):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Layout slides must use unique 'index' values.",
+            }
+        )
+    for position, slide in enumerate(slides):
+        if not 0 <= slide["index"] < len(blocks):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Layout slide {position} index {slide['index']} out "
+                        f"of range for {len(blocks)} sections."
+                    ),
+                }
+            )
+
+    ordered = sorted(
+        enumerate(slides),
+        key=lambda pair: (_as_float(pair[1].get("order"), float(pair[0])), pair[0]),
+    )
+    output_blocks: list[str] = []
+    hidden_removed = 0
+    overlays_injected = 0
+    referenced: set[int] = set()
+    for _, slide in ordered:
+        index = slide["index"]
+        referenced.add(index)
+        if slide.get("hidden"):
+            hidden_removed += 1
+            continue
+        block, injected = _inject_overlays(blocks[index], slide.get("overlays") or [])
+        output_blocks.append(block)
+        overlays_injected += injected
+    for index, block in enumerate(blocks):
+        if index not in referenced:
+            output_blocks.append(block)
+
+    document = _swap_theme_link(
+        prefix + "".join(output_blocks) + suffix, str(layout.get("theme", ""))
+    )
+
+    out_path = _resolve_deck_path(out, workspace) if out else dest_path
+    try:
+        out_path.write_text(document, encoding="utf-8")
+    except OSError as e:
+        return json.dumps({"success": False, "error": f"Cannot write deck: {e}"})
+
+    return json.dumps(
+        {
+            "success": True,
+            "dest": str(out_path),
+            "sections": len(output_blocks),
+            "hidden_removed": hidden_removed,
+            "overlays_injected": overlays_injected,
         },
         indent=2,
     )
