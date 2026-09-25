@@ -1601,6 +1601,8 @@ async def test_prompt_missing_required_argument_raises():
     """Verify the SDK rejects a prompts/get call missing required arguments."""
     with pytest.raises(ValueError, match="Missing required arguments"):
         await mcp.get_prompt("title_slide", {})
+
+
 def test_build_export_command_transition_none():
     """Verify transition=none builds normalize commands plus a concat list."""
     commands = _build_export_command(
@@ -2528,6 +2530,8 @@ async def test_server_list_tools_includes_screenshot_and_contact():
     contact_tool = next(t for t in tools if t.name == "contact_sheet")
     assert "columns" in contact_tool.input_schema["properties"]
     assert "tile_width" in contact_tool.input_schema["properties"]
+
+
 def test_apply_deck_layout_invalid_layout(tmp_path):
     """Verify unparseable and versionless layouts return error envelopes."""
     (tmp_path / "deck.html").write_text(_APPLY_DECK_HTML)

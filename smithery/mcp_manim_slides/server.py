@@ -101,7 +101,8 @@ def slides_list() -> str:
             {
                 "success": False,
                 "error": f"Slides folder not found: {folder_path}",
-            }
+            },
+            indent=2,
         )
     scenes = _collect_scene_metadata(folder_path)
     return json.dumps(
@@ -447,7 +448,7 @@ def _run_convert(
     """Run a ``manim-slides convert`` command and return a structured JSON result."""
     availability_error = _manim_slides_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
     try:
         result = subprocess.run(
             command,
@@ -474,21 +475,24 @@ def _run_convert(
             {
                 "success": False,
                 "error": f"Conversion timed out after {timeout}s: {e}",
-            }
+            },
+            indent=2,
         )
     except FileNotFoundError as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"manim-slides executable not found: {e}",
-            }
+            },
+            indent=2,
         )
     except Exception as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Error executing convert tool: {e}",
-            }
+            },
+            indent=2,
         )
 
 
@@ -594,7 +598,7 @@ def export_revealjs_html(
     """
     error = _validate_reveal_options(theme, transition, transition_speed)
     if error:
-        return json.dumps({"success": False, "error": error})
+        return json.dumps({"success": False, "error": error}, indent=2)
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     command = _build_revealjs_export_command(
         scenes=scenes,
@@ -716,14 +720,16 @@ def serve_revealjs_html(
             {
                 "success": False,
                 "error": f"HTML deck not found: {dest_path}",
-            }
+            },
+            indent=2,
         )
     if dest_path.suffix.lower() != ".html":
         return json.dumps(
             {
                 "success": False,
                 "error": f"Expected an .html file, got: {dest_path}",
-            }
+            },
+            indent=2,
         )
 
     try:
@@ -740,7 +746,8 @@ def serve_revealjs_html(
             {
                 "success": False,
                 "error": f"Failed to start preview server: {e}",
-            }
+            },
+            indent=2,
         )
 
     url = f"http://{host}:{bound_port}/{url_path}"
@@ -1075,14 +1082,16 @@ def serve_deck_editor(
             {
                 "success": False,
                 "error": f"HTML deck not found: {dest_path}",
-            }
+            },
+            indent=2,
         )
     if dest_path.suffix.lower() != ".html":
         return json.dumps(
             {
                 "success": False,
                 "error": f"Expected an .html file, got: {dest_path}",
-            }
+            },
+            indent=2,
         )
     editor_js = _editor_js_path()
     if not editor_js.is_file():
@@ -1090,7 +1099,8 @@ def serve_deck_editor(
             {
                 "success": False,
                 "error": f"Editor asset not found: {editor_js}",
-            }
+            },
+            indent=2,
         )
 
     try:
@@ -1120,7 +1130,8 @@ def serve_deck_editor(
             {
                 "success": False,
                 "error": f"Failed to start preview server: {e}",
-            }
+            },
+            indent=2,
         )
 
     url = f"http://{host}:{bound_port}/{url_path}"
@@ -1389,26 +1400,29 @@ def apply_deck_layout(
             {
                 "success": False,
                 "error": f"HTML deck not found: {dest_path}",
-            }
+            },
+            indent=2,
         )
     if dest_path.suffix.lower() != ".html":
         return json.dumps(
             {
                 "success": False,
                 "error": f"Expected an .html file, got: {dest_path}",
-            }
+            },
+            indent=2,
         )
     layout_file = Path(layout_path)
     if not layout_file.is_absolute():
         layout_file = workspace / layout_file
     layout, error = _load_deck_layout(layout_file)
     if error is not None:
-        return json.dumps({"success": False, "error": error})
+        return json.dumps({"success": False, "error": error}, indent=2)
 
     slides = layout.get("slides", [])
     if not isinstance(slides, list):
         return json.dumps(
-            {"success": False, "error": "Layout 'slides' must be a list."}
+            {"success": False, "error": "Layout 'slides' must be a list."},
+            indent=2,
         )
     for position, slide in enumerate(slides):
         if not isinstance(slide, dict):
@@ -1416,7 +1430,8 @@ def apply_deck_layout(
                 {
                     "success": False,
                     "error": f"Layout slide {position} must be an object.",
-                }
+                },
+                indent=2,
             )
         index = slide.get("index")
         if not isinstance(index, int) or isinstance(index, bool):
@@ -1424,7 +1439,8 @@ def apply_deck_layout(
                 {
                     "success": False,
                     "error": f"Layout slide {position} needs an integer 'index'.",
-                }
+                },
+                indent=2,
             )
         overlays = slide.get("overlays", [])
         if not isinstance(overlays, list) or not all(
@@ -1437,13 +1453,17 @@ def apply_deck_layout(
                         f"Layout slide {position} 'overlays' must be a "
                         "list of objects."
                     ),
-                }
+                },
+                indent=2,
             )
 
     try:
         source = dest_path.read_text(encoding="utf-8")
     except OSError as e:
-        return json.dumps({"success": False, "error": f"Cannot read deck: {e}"})
+        return json.dumps(
+            {"success": False, "error": f"Cannot read deck: {e}"},
+            indent=2,
+        )
 
     prefix, blocks, suffix = _split_sections(source)
     if not blocks:
@@ -1451,7 +1471,8 @@ def apply_deck_layout(
             {
                 "success": False,
                 "error": f"No <section> blocks found in: {dest_path}",
-            }
+            },
+            indent=2,
         )
 
     indices = [slide["index"] for slide in slides]
@@ -1460,7 +1481,8 @@ def apply_deck_layout(
             {
                 "success": False,
                 "error": "Layout slides must use unique 'index' values.",
-            }
+            },
+            indent=2,
         )
     for position, slide in enumerate(slides):
         if not 0 <= slide["index"] < len(blocks):
@@ -1471,7 +1493,8 @@ def apply_deck_layout(
                         f"Layout slide {position} index {slide['index']} out "
                         f"of range for {len(blocks)} sections."
                     ),
-                }
+                },
+                indent=2,
             )
 
     ordered = sorted(
@@ -1503,7 +1526,10 @@ def apply_deck_layout(
     try:
         out_path.write_text(document, encoding="utf-8")
     except OSError as e:
-        return json.dumps({"success": False, "error": f"Cannot write deck: {e}"})
+        return json.dumps(
+            {"success": False, "error": f"Cannot write deck: {e}"},
+            indent=2,
+        )
 
     return json.dumps(
         {
@@ -1662,7 +1688,8 @@ def screenshot_deck(
                     f"Unsupported output_format '{output_format}'. "
                     f"Valid formats: {supported}."
                 ),
-            }
+            },
+            indent=2,
         )
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR") or "."
     workspace = Path(cwd).resolve()
@@ -1675,19 +1702,21 @@ def screenshot_deck(
             {
                 "success": False,
                 "error": f"HTML deck not found: {dest_path}",
-            }
+            },
+            indent=2,
         )
     if dest_path.suffix.lower() != ".html":
         return json.dumps(
             {
                 "success": False,
                 "error": f"Expected an .html file, got: {dest_path}",
-            }
+            },
+            indent=2,
         )
 
     availability_error = _playwright_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
 
     try:
         url_path = dest_path.relative_to(workspace).as_posix()
@@ -1703,7 +1732,8 @@ def screenshot_deck(
             {
                 "success": False,
                 "error": f"Failed to start preview server: {e}",
-            }
+            },
+            indent=2,
         )
 
     url = f"http://127.0.0.1:{bound_port}/{url_path}"
@@ -1723,7 +1753,7 @@ def screenshot_deck(
             timeout=timeout,
         )
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
 
     return json.dumps(
         {
@@ -1856,7 +1886,8 @@ def list_scenes(folder: str = "slides", workspace_dir: str | None = None) -> str
             {
                 "success": False,
                 "error": f"Slides folder not found: {folder_path}",
-            }
+            },
+            indent=2,
         )
     scenes = _collect_scene_metadata(folder_path)
     return json.dumps(
@@ -1908,7 +1939,8 @@ def preview_slide(
                     f"Unsupported output_format '{output_format}'. "
                     f"Valid formats: {', '.join(supported)}."
                 ),
-            }
+            },
+            indent=2,
         )
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     folder_path = Path(cwd or ".").joinpath(folder)
@@ -1918,7 +1950,8 @@ def preview_slide(
             {
                 "success": False,
                 "error": f"Scene '{scene}' not found in {folder_path}.",
-            }
+            },
+            indent=2,
         )
     slides = data.get("slides", [])
     if not 0 <= slide_index < len(slides):
@@ -1929,7 +1962,8 @@ def preview_slide(
                     f"Slide index {slide_index} out of range "
                     f"(scene '{scene}' has {len(slides)} slides)."
                 ),
-            }
+            },
+            indent=2,
         )
     slide = slides[slide_index]
     media = _resolve_slide_media(cwd, slide)
@@ -1938,7 +1972,8 @@ def preview_slide(
             {
                 "success": False,
                 "error": f"Slide media file not found: {slide.get('file')}",
-            }
+            },
+            indent=2,
         )
     slide_type = slide.get("type")
     if slide_type == "image" and output_format in PREVIEW_VIDEO_FORMATS:
@@ -1949,7 +1984,8 @@ def preview_slide(
                     f"Cannot preview image slide as '{output_format}'. "
                     "Use an image format (png/jpg/webp) instead."
                 ),
-            }
+            },
+            indent=2,
         )
 
     preview_dir = Path(cwd or ".").joinpath("preview")
@@ -2001,7 +2037,8 @@ def preview_slide(
                         "ffmpeg executable not found. "
                         "Install FFmpeg to generate previews."
                     ),
-                }
+                },
+                indent=2,
             )
         command[0] = ffmpeg
         try:
@@ -2016,7 +2053,8 @@ def preview_slide(
                 {
                     "success": False,
                     "error": f"Preview generation timed out after {timeout}s: {e}",
-                }
+                },
+                indent=2,
             )
         if result.returncode != 0:
             return json.dumps(
@@ -2025,7 +2063,8 @@ def preview_slide(
                     "error": (
                         result.stderr.strip() or "Unknown preview generation error."
                     ),
-                }
+                },
+                indent=2,
             )
     else:
         shutil.copyfile(media, destination)
@@ -2169,14 +2208,16 @@ def contact_sheet(
             {
                 "success": False,
                 "error": f"Invalid columns {columns}. Must be at least 1.",
-            }
+            },
+            indent=2,
         )
     if tile_width < 2:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Invalid tile_width {tile_width}. Must be at least 2.",
-            }
+            },
+            indent=2,
         )
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     folder_path = Path(cwd or ".").joinpath(folder)
@@ -2189,7 +2230,8 @@ def contact_sheet(
                 {
                     "success": False,
                     "error": f"No rendered scenes found in {folder_path}.",
-                }
+                },
+                indent=2,
             )
     else:
         selected = []
@@ -2200,7 +2242,8 @@ def contact_sheet(
                     {
                         "success": False,
                         "error": f"Scene '{name}' not found in {folder_path}.",
-                    }
+                    },
+                    indent=2,
                 )
             selected.append(entry)
 
@@ -2213,7 +2256,8 @@ def contact_sheet(
                     {
                         "success": False,
                         "error": f"Slide media file not found: {slide.get('file')}",
-                    }
+                    },
+                    indent=2,
                 )
             media_files.append(media)
     if not media_files:
@@ -2221,7 +2265,8 @@ def contact_sheet(
             {
                 "success": False,
                 "error": f"No slides found in {folder_path}.",
-            }
+            },
+            indent=2,
         )
 
     ffmpeg = _ffmpeg_executable()
@@ -2233,7 +2278,8 @@ def contact_sheet(
                     "ffmpeg executable not found. "
                     "Install FFmpeg to generate contact sheets."
                 ),
-            }
+            },
+            indent=2,
         )
 
     tile_height: int | None = None
@@ -2282,7 +2328,8 @@ def contact_sheet(
                             f"Contact sheet generation timed out after "
                             f"{timeout}s: {e}"
                         ),
-                    }
+                    },
+                    indent=2,
                 )
             if result.returncode != 0:
                 return json.dumps(
@@ -2292,7 +2339,8 @@ def contact_sheet(
                             result.stderr.strip()
                             or "Unknown contact sheet generation error."
                         ),
-                    }
+                    },
+                    indent=2,
                 )
             frame_paths.append(str(frame_path))
 
@@ -2318,7 +2366,8 @@ def contact_sheet(
                     "error": (
                         f"Contact sheet generation timed out after {timeout}s: {e}"
                     ),
-                }
+                },
+                indent=2,
             )
         if result.returncode != 0:
             return json.dumps(
@@ -2328,7 +2377,8 @@ def contact_sheet(
                         result.stderr.strip()
                         or "Unknown contact sheet generation error."
                     ),
-                }
+                },
+                indent=2,
             )
 
     rows = (len(media_files) + columns - 1) // columns
@@ -2544,21 +2594,24 @@ def export_video(
                     f"Invalid transition '{transition}'. "
                     f"Valid transitions: {', '.join(EXPORT_TRANSITIONS)}."
                 ),
-            }
+            },
+            indent=2,
         )
     if fps < 1:
         return json.dumps(
             {
                 "success": False,
                 "error": f"fps must be a positive integer, got {fps}.",
-            }
+            },
+            indent=2,
         )
     if image_duration <= 0:
         return json.dumps(
             {
                 "success": False,
                 "error": f"image_duration must be positive, got {image_duration}.",
-            }
+            },
+            indent=2,
         )
     if transition_duration < 0:
         return json.dumps(
@@ -2568,10 +2621,11 @@ def export_video(
                     f"transition_duration must be non-negative, "
                     f"got {transition_duration}."
                 ),
-            }
+            },
+            indent=2,
         )
     if not scenes:
-        return json.dumps({"success": False, "error": "No scenes provided."})
+        return json.dumps({"success": False, "error": "No scenes provided."}, indent=2)
 
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     folder_path = Path(cwd or ".").joinpath(folder)
@@ -2585,7 +2639,8 @@ def export_video(
                 {
                     "success": False,
                     "error": f"Scene '{scene}' not found in {folder_path}.",
-                }
+                },
+                indent=2,
             )
         if first_resolution is None:
             first_resolution = data.get("resolution")
@@ -2602,7 +2657,8 @@ def export_video(
             {
                 "success": False,
                 "error": f"No slides found in scenes: {', '.join(scenes)}.",
-            }
+            },
+            indent=2,
         )
 
     missing = [
@@ -2615,7 +2671,8 @@ def export_video(
             {
                 "success": False,
                 "error": f"Slide media files not found: {', '.join(missing)}.",
-            }
+            },
+            indent=2,
         )
 
     if width is None or height is None:
@@ -2634,7 +2691,8 @@ def export_video(
                     "Could not determine target width/height: pass them "
                     "explicitly or render scenes with a valid 'resolution' entry."
                 ),
-            }
+            },
+            indent=2,
         )
     if width < 1 or height < 1:
         return json.dumps(
@@ -2644,7 +2702,8 @@ def export_video(
                     f"width and height must be positive integers, "
                     f"got {width}x{height}."
                 ),
-            }
+            },
+            indent=2,
         )
 
     ffmpeg = _ffmpeg_executable()
@@ -2656,7 +2715,8 @@ def export_video(
                     "ffmpeg executable not found. "
                     "Install FFmpeg to export videos."
                 ),
-            }
+            },
+            indent=2,
         )
 
     destination = Path(cwd or ".").joinpath(dest).resolve()
@@ -2728,7 +2788,8 @@ def export_video(
                             "Could not determine slide segment durations "
                             "with ffprobe."
                         ),
-                    }
+                    },
+                    indent=2,
                 )
             if transition == "fade":
                 commands = _build_export_command(
@@ -2794,21 +2855,24 @@ def export_video(
             {
                 "success": False,
                 "error": f"Video export timed out after {timeout}s: {e}",
-            }
+            },
+            indent=2,
         )
     except FileNotFoundError as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"ffmpeg executable not found: {e}",
-            }
+            },
+            indent=2,
         )
     except Exception as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Error executing export_video tool: {e}",
-            }
+            },
+            indent=2,
         )
 
 
@@ -3478,11 +3542,11 @@ async def execute_manim_code(
 
     syntax_error = _validate_python_syntax(code)
     if syntax_error:
-        return json.dumps({"success": False, "error": syntax_error})
+        return json.dumps({"success": False, "error": syntax_error}, indent=2)
 
     availability_error = _manim_slides_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
 
     preamble, fragments = _extract_scene_fragments(code)
     requested = list(scenes) if scenes else list(fragments)
@@ -3594,21 +3658,24 @@ async def execute_manim_code(
             {
                 "success": False,
                 "error": f"Rendering timed out after {timeout}s: {e}",
-            }
+            },
+            indent=2,
         )
     except FileNotFoundError as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"manim-slides executable not found: {e}",
-            }
+            },
+            indent=2,
         )
     except Exception as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Error executing execute_manim_code tool: {e}",
-            }
+            },
+            indent=2,
         )
 
 
@@ -3664,11 +3731,11 @@ def sync_deck(
 
     syntax_error = _validate_python_syntax(code)
     if syntax_error:
-        return json.dumps({"success": False, "error": syntax_error})
+        return json.dumps({"success": False, "error": syntax_error}, indent=2)
 
     availability_error = _manim_slides_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
 
     preamble, fragments = _extract_scene_fragments(code)
     requested = list(scenes) if scenes else list(fragments)
@@ -3680,7 +3747,8 @@ def sync_deck(
                     "No scenes to sync: define Scene/Slide classes in the code "
                     "or pass scenes explicitly."
                 ),
-            }
+            },
+            indent=2,
         )
 
     previous_state = _load_sync_state(workspace)
@@ -3719,21 +3787,24 @@ def sync_deck(
                 {
                     "success": False,
                     "error": f"Rendering timed out after {timeout}s: {e}",
-                }
+                },
+                indent=2,
             )
         except FileNotFoundError as e:
             return json.dumps(
                 {
                     "success": False,
                     "error": f"manim-slides executable not found: {e}",
-                }
+                },
+                indent=2,
             )
         except Exception as e:
             return json.dumps(
                 {
                     "success": False,
                     "error": f"Error executing sync_deck tool: {e}",
-                }
+                },
+                indent=2,
             )
         if not render_result.get("success"):
             failure = {

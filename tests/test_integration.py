@@ -199,6 +199,8 @@ async def test_get_prompt_multi_value_round_trip(mcp_client):
     text = result.messages[0].content.text
     assert "1. Intro" in text
     assert "2. Demo" in text
+
+
 @pytest.mark.anyio
 async def test_call_contact_sheet_missing_scene(mcp_client, tmp_path):
     """Verify contact_sheet reports a missing scene over the transport."""
