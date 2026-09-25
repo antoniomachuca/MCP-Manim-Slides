@@ -15,34 +15,46 @@ from mcp_manim_slides.server import (
     REVEAL_TRANSITION_SPEEDS,
     REVEAL_TRANSITIONS,
     RenderProgress,
+    _build_contact_sheet_command,
     _build_convert_command,
+    _build_export_command,
     _build_render_command,
     _build_reveal_config,
     _build_revealjs_export_command,
+    _capture_deck_screenshots,
+    _concat_list_text,
     _extract_missing_module,
+    _extract_scene_fragments,
+    _ffprobe_duration,
     _format_progress_message,
     _load_render_cache,
     _manim_slides_availability_error,
     _parse_render_progress,
+    _playwright_availability_error,
     _render_cache_key,
     _restore_render_cache,
     _run_render_streaming,
     _save_render_cache,
+    _scene_cache_key,
     _temporary_script,
     _validate_python_syntax,
     _validate_reveal_options,
     compile_presentation,
+    contact_sheet,
     execute_manim_code,
     export_revealjs_html,
+    export_video,
     hello_world,
     list_scenes,
     mcp,
     preview_slide,
     revealjs_config_options,
+    screenshot_deck,
     serve_revealjs_html,
     server_status,
     slides_list,
     stop_preview_server,
+    sync_deck,
 )
 
 
@@ -688,6 +700,7 @@ async def test_execute_manim_code_cache_hit_skips_render(monkeypatch, tmp_path):
     )
     assert first["success"] is True
     assert "cached" not in first
+    assert first["scene_cache"] == {"MySlide": False}
     assert len(calls) == 1
 
     second = json.loads(
@@ -695,6 +708,7 @@ async def test_execute_manim_code_cache_hit_skips_render(monkeypatch, tmp_path):
     )
     assert second["success"] is True
     assert second["cached"] is True
+    assert second["scene_cache"] == {"MySlide": True}
     assert any(f.endswith("MySlide.mp4") for f in second["media_files"])
     assert len(calls) == 1
 
@@ -729,7 +743,325 @@ async def test_execute_manim_code_disable_cache(monkeypatch, tmp_path):
     assert second["success"] is True
     assert "cached" not in first
     assert "cached" not in second
+    assert first["scene_cache"] == {"MySlide": False}
+    assert second["scene_cache"] == {"MySlide": False}
     assert len(calls) == 2
+
+
+FRAGMENT_CODE = (
+    "from manim_slides import Slide\n"
+    "\n"
+    "def helper():\n"
+    "    return 1\n"
+    "\n"
+    "class A(Slide):\n"
+    "    def construct(self):\n"
+    "        pass\n"
+    "\n"
+    "class B(Slide):\n"
+    "    def construct(self):\n"
+    "        pass\n"
+)
+
+
+def test_extract_scene_fragments_captures_preamble_and_classes():
+    """Verify class sources are exact and shared helpers land in the preamble."""
+    preamble, fragments = _extract_scene_fragments(FRAGMENT_CODE)
+    assert fragments == {
+        "A": "class A(Slide):\n    def construct(self):\n        pass",
+        "B": "class B(Slide):\n    def construct(self):\n        pass",
+    }
+    assert preamble == "from manim_slides import Slide\ndef helper():\n    return 1"
+    assert "def helper" in preamble
+    assert "from manim_slides import Slide" in preamble
+    assert "class A" not in preamble
+    assert "class B" not in preamble
+    assert "class A" not in fragments["B"]
+
+
+def test_extract_scene_fragments_includes_decorators():
+    """Verify decorator lines are part of the owning scene's source."""
+    preamble, fragments = _extract_scene_fragments("@echo\nclass A(Slide):\n    pass\n")
+    assert preamble == ""
+    assert fragments == {"A": "@echo\nclass A(Slide):\n    pass"}
+
+
+def test_extract_scene_fragments_invalid_code():
+    """Verify invalid code degrades to an empty result instead of raising."""
+    assert _extract_scene_fragments("def broken(:\n") == ("", {})
+
+
+def test_scene_cache_key_stability_and_sensitivity():
+    """Verify editing one scene only changes that scene's cache key."""
+    code_one = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        x = 1\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        x = 2\n"
+    )
+    code_two = code_one.replace("        x = 1\n", "        x = 99\n")
+    preamble_one, fragments_one = _extract_scene_fragments(code_one)
+    preamble_two, fragments_two = _extract_scene_fragments(code_two)
+    assert preamble_one == preamble_two
+
+    key_a_one = _scene_cache_key(preamble_one, fragments_one["A"], "l")
+    key_a_two = _scene_cache_key(preamble_two, fragments_two["A"], "l")
+    key_b_one = _scene_cache_key(preamble_one, fragments_one["B"], "l")
+    key_b_two = _scene_cache_key(preamble_two, fragments_two["B"], "l")
+
+    assert key_a_one != key_a_two
+    assert key_b_one == key_b_two
+    assert key_b_one == _scene_cache_key(preamble_one, fragments_one["B"], "l")
+    assert key_b_one != _scene_cache_key(preamble_one, fragments_one["B"], "h")
+
+
+def test_scene_cache_key_shared_helper_change_invalidates_all():
+    """Verify a preamble change flips every scene's key."""
+    code_one = "def helper():\n    return 1\nclass A(Slide):\n    pass\n"
+    code_two = "def helper():\n    return 2\nclass A(Slide):\n    pass\n"
+    preamble_one, fragments_one = _extract_scene_fragments(code_one)
+    preamble_two, fragments_two = _extract_scene_fragments(code_two)
+    assert preamble_one != preamble_two
+    assert _scene_cache_key(preamble_one, fragments_one["A"], "l") != _scene_cache_key(
+        preamble_two, fragments_two["A"], "l"
+    )
+
+
+@pytest.mark.anyio
+async def test_execute_manim_code_partial_cache_hit_renders_only_missed(
+    monkeypatch, tmp_path
+):
+    """Verify cached scenes are restored and only misses reach the renderer."""
+    code = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+    )
+    preamble, fragments = _extract_scene_fragments(code)
+    key_a = _scene_cache_key(preamble, fragments["A"], "l")
+    key_b = _scene_cache_key(preamble, fragments["B"], "l")
+    seeded_video = tmp_path / "videos" / "480p15" / "A.mp4"
+    seeded_video.parent.mkdir(parents=True, exist_ok=True)
+    seeded_video.write_text("cached-a")
+    seeded_config = tmp_path / "slides" / "A.json"
+    seeded_config.parent.mkdir(parents=True, exist_ok=True)
+    seeded_config.write_text("{}")
+    _save_render_cache(tmp_path, key_a, [str(seeded_video), str(seeded_config)])
+
+    render_calls: list[list[str]] = []
+
+    async def fake_render(
+        command, workspace, scenes, quality, start, timeout, ctx=None
+    ):
+        render_calls.append(list(scenes))
+        media_files = []
+        for scene in scenes:
+            video = workspace / "videos" / "480p15" / f"{scene}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_text("fake")
+            media_files.append(str(video))
+            config = workspace / "slides" / f"{scene}.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("{}")
+        return {
+            "success": True,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": media_files,
+            "command": command,
+            "stdout": "Rendered",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr("mcp_manim_slides.server._run_render_streaming", fake_render)
+    result = json.loads(
+        await execute_manim_code(code=code, scenes=["A", "B"], media_dir=str(tmp_path))
+    )
+    assert result["success"] is True
+    assert render_calls == [["B"]]
+    assert result["scene_cache"] == {"A": True, "B": False}
+    assert result["scenes"] == ["A", "B"]
+    assert any(f.endswith("A.mp4") for f in result["media_files"])
+    assert any(f.endswith("B.mp4") for f in result["media_files"])
+    assert _load_render_cache(tmp_path, key_b) is not None
+
+
+def _fake_render_streaming(calls: list[list[str]]):
+    """Return an async ``_run_render_streaming`` stand-in that records scenes."""
+
+    async def fake(command, workspace, scenes, quality, start, timeout, ctx=None):
+        calls.append(list(scenes))
+        media_files = []
+        for scene in scenes:
+            video = workspace / "videos" / "480p15" / f"{scene}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_text("fake")
+            media_files.append(str(video))
+            config = workspace / "slides" / f"{scene}.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("{}")
+        return {
+            "success": True,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": media_files,
+            "command": command,
+            "stdout": "Rendered",
+            "stderr": "",
+        }
+
+    return fake
+
+
+def _fake_convert(calls: list[dict]):
+    """Return a ``_run_convert`` stand-in that records convert invocations."""
+
+    def fake(command, dest, scenes, output_format, cwd, timeout):
+        calls.append({"dest": dest, "scenes": list(scenes)})
+        destination = Path(cwd).joinpath(dest).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("<html>deck</html>")
+        return json.dumps(
+            {
+                "success": True,
+                "format": output_format,
+                "destination": str(destination),
+                "scenes": scenes,
+                "command": command,
+                "stdout": "",
+                "stderr": "",
+            }
+        )
+
+    return fake
+
+
+def test_sync_deck_renders_reuses_and_removes(monkeypatch, tmp_path):
+    """Verify sync renders once, reuses cached scenes, and reports removals."""
+    render_calls: list[list[str]] = []
+    convert_calls: list[dict] = []
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._run_render_streaming",
+        _fake_render_streaming(render_calls),
+    )
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._run_convert", _fake_convert(convert_calls)
+    )
+
+    code_both = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+    )
+
+    first = json.loads(
+        sync_deck(code=code_both, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert first["success"] is True
+    assert first["rendered"] == ["A", "B"]
+    assert first["reused"] == []
+    assert first["removed"] == []
+    assert first["scene_cache"] == {"A": False, "B": False}
+    assert render_calls == [["A", "B"]]
+    assert first["dest"].endswith("deck.html")
+    state_path = tmp_path / ".sync_state.json"
+    state = json.loads(state_path.read_text())
+    assert set(state["scenes"]) == {"A", "B"}
+
+    second = json.loads(
+        sync_deck(code=code_both, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert second["success"] is True
+    assert second["rendered"] == []
+    assert second["reused"] == ["A", "B"]
+    assert second["scene_cache"] == {"A": True, "B": True}
+    assert render_calls == [["A", "B"]]
+
+    code_edited = code_both.replace(
+        "class B(Slide):\n    def construct(self):\n        pass",
+        "class B(Slide):\n    def construct(self):\n        step = 1",
+    )
+    third = json.loads(
+        sync_deck(code=code_edited, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert third["success"] is True
+    assert third["rendered"] == ["B"]
+    assert third["reused"] == ["A"]
+    assert third["scene_cache"] == {"A": True, "B": False}
+    assert render_calls == [["A", "B"], ["B"]]
+
+    code_only_a = "class A(Slide):\n    def construct(self):\n        pass\n"
+    fourth = json.loads(
+        sync_deck(code=code_only_a, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert fourth["success"] is True
+    assert fourth["removed"] == ["B"]
+    assert fourth["rendered"] == []
+    assert fourth["reused"] == ["A"]
+    assert render_calls == [["A", "B"], ["B"]]
+    state = json.loads(state_path.read_text())
+    assert set(state["scenes"]) == {"A"}
+    assert convert_calls[-1]["scenes"] == ["A"]
+
+
+def test_sync_deck_syntax_error_envelope(tmp_path):
+    """Verify invalid code fails fast without touching the sync state."""
+    result = json.loads(sync_deck(code="def broken(:\n", media_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "SyntaxError" in result["error"]
+    assert not (tmp_path / ".sync_state.json").exists()
+
+
+def test_sync_deck_render_failure_returns_error_envelope(monkeypatch, tmp_path):
+    """Verify render failures keep the error envelope and skip state writes."""
+
+    async def fake_fail(command, workspace, scenes, quality, start, timeout, ctx=None):
+        return {
+            "success": False,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": [],
+            "command": command,
+            "stdout": "",
+            "stderr": "ModuleNotFoundError: No module named 'numpy'",
+            "error": "ModuleNotFoundError: No module named 'numpy'",
+            "missing_dependency": "numpy",
+            "hint": "The Python module 'numpy' is not installed. "
+            "Install it with 'pip install numpy'.",
+        }
+
+    monkeypatch.setattr("mcp_manim_slides.server._run_render_streaming", fake_fail)
+    result = json.loads(
+        sync_deck(
+            code="class A(Slide):\n    def construct(self):\n        pass\n",
+            media_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert "ModuleNotFoundError" in result["error"]
+    assert result["missing_dependency"] == "numpy"
+    assert "pip install numpy" in result["hint"]
+    assert not (tmp_path / ".sync_state.json").exists()
+
+
+def test_sync_deck_no_scenes_reports_error(tmp_path):
+    """Verify code without scene classes is rejected before any subprocess."""
+    result = json.loads(
+        sync_deck(code="def helper():\n    return 1\n", media_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "No scenes to sync" in result["error"]
 
 
 def test_parse_render_progress_full_bar():
@@ -793,6 +1125,20 @@ async def test_server_list_tools_includes_execute_manim_code():
     assert "manim-slides render" in exec_tool.description
     assert "code" in exec_tool.input_schema["properties"]
     assert "scenes" in exec_tool.input_schema["properties"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_sync_deck():
+    """Verify sync_deck tool is registered on the MCPServer."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "sync_deck" in tool_names
+
+    sync_tool = next(t for t in tools if t.name == "sync_deck")
+    assert "code" in sync_tool.input_schema["properties"]
+    assert "dest" in sync_tool.input_schema["properties"]
+    assert "quality" in sync_tool.input_schema["properties"]
+    assert "ctx" not in sync_tool.input_schema["properties"]
 
 
 def _write_scene_config(tmp_path: Path, scene: str, slides: list[dict]) -> Path:
@@ -1108,3 +1454,771 @@ async def test_server_list_tools_includes_serve_and_stop():
     assert "dest" in serve_tool.input_schema["properties"]
     assert "port" in serve_tool.input_schema["properties"]
     assert "open_browser" in serve_tool.input_schema["properties"]
+
+
+ALL_PROMPT_NAMES = {
+    "title_slide",
+    "agenda",
+    "code_walkthrough",
+    "math_derivation",
+    "two_column_comparison",
+}
+
+
+def _prompt_text(result) -> str:
+    """Return the concatenated text of a GetPromptResult's messages."""
+    return "\n".join(message.content.text for message in result.messages)
+
+
+@pytest.mark.anyio
+async def test_server_list_prompts():
+    """Verify all five slide-archetype prompts are registered."""
+    prompts = await mcp.list_prompts()
+    names = {prompt.name for prompt in prompts}
+    assert ALL_PROMPT_NAMES <= names
+
+
+@pytest.mark.anyio
+async def test_prompt_title_slide_includes_title():
+    """Verify title_slide embeds the given title and chaining instructions."""
+    result = await mcp.get_prompt(
+        "title_slide",
+        {
+            "title": "Quantum Computing 101",
+            "subtitle": "A gentle introduction",
+            "author": "Ada Lovelace",
+        },
+    )
+    text = _prompt_text(result)
+    assert "Quantum Computing 101" in text
+    assert "A gentle introduction" in text
+    assert "Ada Lovelace" in text
+    assert "self.next_slide()" in text
+    assert "execute_manim_code" in text
+    assert "export_revealjs_html" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_agenda_parses_comma_separated_topics():
+    """Verify agenda splits a comma-separated topics string into a list."""
+    result = await mcp.get_prompt("agenda", {"topics": "Intro, Demo, Results"})
+    text = _prompt_text(result)
+    assert "1. Intro" in text
+    assert "2. Demo" in text
+    assert "3. Results" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_code_walkthrough_embeds_code_verbatim():
+    """Verify code_walkthrough keeps the supplied code intact in the body."""
+    snippet = "def answer():\n    return {'value': 42}"
+    result = await mcp.get_prompt(
+        "code_walkthrough", {"code": snippet, "title": "Deep Dive"}
+    )
+    text = _prompt_text(result)
+    assert snippet in text
+    assert "Deep Dive" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_math_derivation_lists_steps():
+    """Verify math_derivation splits comma-separated LaTeX steps."""
+    result = await mcp.get_prompt(
+        "math_derivation", {"steps": "f(x) = x^2, f'(x) = 2x", "title": "Calculus"}
+    )
+    text = _prompt_text(result)
+    assert "1. f(x) = x^2" in text
+    assert "2. f'(x) = 2x" in text
+    assert "Calculus" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_two_column_comparison_lists_both_sides():
+    """Verify two_column_comparison renders both columns' titles and points."""
+    result = await mcp.get_prompt(
+        "two_column_comparison",
+        {
+            "left_title": "Pros",
+            "right_title": "Cons",
+            "left_points": "Fast, Cheap",
+            "right_points": "Limited, Buggy",
+        },
+    )
+    text = _prompt_text(result)
+    assert "Pros" in text
+    assert "Cons" in text
+    assert "1. Fast" in text
+    assert "2. Cheap" in text
+    assert "1. Limited" in text
+    assert "2. Buggy" in text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("title_slide", {"title": "T"}),
+        ("agenda", {"topics": "A"}),
+        ("code_walkthrough", {"code": "pass"}),
+        ("math_derivation", {"steps": "x = 1"}),
+        (
+            "two_column_comparison",
+            {
+                "left_title": "L",
+                "right_title": "R",
+                "left_points": "p1",
+                "right_points": "p2",
+            },
+        ),
+    ],
+)
+async def test_prompt_bodies_include_mechanics_and_toolchain(name, arguments):
+    """Verify every archetype body teaches slide mechanics and the tool chain."""
+    result = await mcp.get_prompt(name, arguments)
+    text = _prompt_text(result)
+    assert "Slide" in text
+    assert "self.next_slide()" in text
+    assert "```python" in text
+    assert "execute_manim_code" in text
+    assert "preview_slide" in text
+    assert "export_revealjs_html" in text
+    assert "compile_presentation" in text
+
+
+@pytest.mark.anyio
+async def test_prompt_missing_required_argument_raises():
+    """Verify the SDK rejects a prompts/get call missing required arguments."""
+    with pytest.raises(ValueError, match="Missing required arguments"):
+        await mcp.get_prompt("title_slide", {})
+
+
+def test_build_export_command_transition_none():
+    """Verify transition=none builds normalize commands plus a concat list."""
+    commands = _build_export_command(
+        media=[
+            {"path": "slides/a.mp4", "type": "video"},
+            {"path": "slides/b.png", "type": "image"},
+        ],
+        dest="presentation.mp4",
+        width=854,
+        height=480,
+        segment_paths=["seg0.mp4", "seg1.mp4"],
+        fps=30,
+        transition="none",
+        image_duration=2.0,
+        concat_list_path="concat.txt",
+    )
+    assert len(commands) == 3
+    video_command, image_command, final_command = commands
+    assert "-loop" not in video_command
+    assert image_command[image_command.index("-loop") + 1] == "1"
+    assert image_command[image_command.index("-t") + 1] == "2.0"
+    for command in (video_command, image_command):
+        assert "-c:v" in command
+        assert "libx264" in command
+        assert "yuv420p" in command
+        video_filter = command[command.index("-vf") + 1]
+        assert "scale=854:480:force_original_aspect_ratio=decrease" in video_filter
+        assert "pad=854:480:(ow-iw)/2:(oh-ih)/2" in video_filter
+        assert "fps=30" in video_filter
+    assert final_command[final_command.index("-f") + 1] == "concat"
+    assert final_command[final_command.index("-i") + 1] == "concat.txt"
+    assert "xfade" not in "".join(final_command)
+    assert final_command[-1] == "presentation.mp4"
+
+
+def test_concat_list_text_lists_segments():
+    """Verify the concat demuxer list file references every segment."""
+    text = _concat_list_text(["seg0.mp4", "seg1.mp4"])
+    assert text == "file 'seg0.mp4'\nfile 'seg1.mp4'\n"
+
+
+def test_build_export_command_transition_fade():
+    """Verify transition=fade builds an xfade chain with measured offsets."""
+    commands = _build_export_command(
+        media=[
+            {"path": "slides/a.mp4", "type": "video"},
+            {"path": "slides/b.png", "type": "image"},
+            {"path": "slides/c.mp4", "type": "video"},
+        ],
+        dest="presentation.mp4",
+        width=640,
+        height=360,
+        segment_paths=["seg0.mp4", "seg1.mp4", "seg2.mp4"],
+        fps=30,
+        transition="fade",
+        transition_duration=0.5,
+        image_duration=2.0,
+        concat_list_path="concat.txt",
+        durations=[2.0, 3.0, 1.5],
+    )
+    assert len(commands) == 4
+    image_command = commands[1]
+    assert image_command[image_command.index("-loop") + 1] == "1"
+    final_command = commands[-1]
+    filter_arg = final_command[final_command.index("-filter_complex") + 1]
+    assert "xfade=transition=fade" in filter_arg
+    assert "duration=0.5" in filter_arg
+    assert "offset=1.5" in filter_arg
+    assert "offset=4.0" in filter_arg
+    assert final_command[final_command.index("-map") + 1] == "[x2]"
+    assert "concat" not in "".join(final_command)
+    assert final_command[-1] == "presentation.mp4"
+
+
+def test_ffprobe_duration_parses_stdout(monkeypatch):
+    """Verify _ffprobe_duration parses the ffprobe duration output."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="2.5\n"),
+    )
+    assert _ffprobe_duration("clip.mp4") == 2.5
+
+
+def test_ffprobe_duration_returns_none_on_failure(monkeypatch):
+    """Verify _ffprobe_duration returns None when the probe fails."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(1, stderr="boom"),
+    )
+    assert _ffprobe_duration("clip.mp4") is None
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(0, stdout="N/A"),
+    )
+    assert _ffprobe_duration("clip.mp4") is None
+
+    def missing_ffprobe(*args, **kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(subprocess, "run", missing_ffprobe)
+    assert _ffprobe_duration("clip.mp4") is None
+
+
+def test_export_video_success(monkeypatch, tmp_path):
+    """Verify export_video assembles the segments into one MP4."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [
+            {"type": "video", "file": "slides/files/Intro/0.mp4"},
+            {"type": "image", "file": "slides/files/Intro/1.png"},
+        ],
+    )
+    _write_scene_config(
+        tmp_path,
+        "Outro",
+        [{"type": "video", "file": "slides/files/Outro/0.mp4"}],
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append(list(command))
+        if command[0] == "ffprobe":
+            return _FakeCompletedProcess(0, stdout="2.0\n")
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+
+    result = json.loads(
+        export_video(
+            scenes=["Intro", "Outro"],
+            dest="presentation.mp4",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is True
+    assert result["dest"] == str((tmp_path / "presentation.mp4").resolve())
+    assert result["scenes"] == ["Intro", "Outro"]
+    assert result["slide_count"] == 3
+    assert result["transition"] == "none"
+    assert result["duration"] == 6.0
+    assert result["command"][0] == "/usr/bin/ffmpeg"
+    ffmpeg_commands = [c for c in captured if c[0] != "ffprobe"]
+    final_command = ffmpeg_commands[-1]
+    assert final_command[final_command.index("-f") + 1] == "concat"
+    normalize_commands = ffmpeg_commands[:-1]
+    assert [Path(c[-1]).name for c in normalize_commands] == [
+        "segment_000.mp4",
+        "segment_001.mp4",
+        "segment_002.mp4",
+    ]
+    assert any("-loop" in c for c in normalize_commands)
+
+
+def test_export_video_fade_builds_xfade_offsets(monkeypatch, tmp_path):
+    """Verify export_video measures segments and chains xfades with offsets."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [
+            {"type": "video", "file": "slides/files/Intro/0.mp4"},
+            {"type": "video", "file": "slides/files/Intro/1.mp4"},
+        ],
+    )
+    captured: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append(list(command))
+        if command[0] == "ffprobe":
+            return _FakeCompletedProcess(0, stdout="2.0\n")
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+
+    result = json.loads(
+        export_video(
+            scenes=["Intro"],
+            dest="presentation.mp4",
+            workspace_dir=str(tmp_path),
+            transition="fade",
+            transition_duration=0.5,
+        )
+    )
+    assert result["success"] is True
+    assert result["transition"] == "fade"
+    assert result["duration"] == 3.5
+    final_command = [c for c in captured if c[0] != "ffprobe"][-1]
+    filter_arg = final_command[final_command.index("-filter_complex") + 1]
+    assert "xfade=transition=fade" in filter_arg
+    assert "offset=1.5" in filter_arg
+    assert final_command[final_command.index("-map") + 1] == "[x1]"
+
+
+def test_export_video_missing_media(tmp_path):
+    """Verify export_video lists every missing slide media file."""
+    slides_dir = tmp_path / "slides"
+    slides_dir.mkdir()
+    (slides_dir / "Intro.json").write_text(
+        json.dumps(
+            {
+                "slides": [
+                    {"type": "video", "file": "slides/files/Intro/0.mp4"},
+                    {"type": "image", "file": "slides/files/Intro/1.png"},
+                ],
+                "resolution": [854, 480],
+            }
+        )
+    )
+    result = json.loads(export_video(scenes=["Intro"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+    assert "slides/files/Intro/0.mp4" in result["error"]
+    assert "slides/files/Intro/1.png" in result["error"]
+
+
+def test_export_video_missing_scene(tmp_path):
+    """Verify export_video reports a missing scene before invoking ffmpeg."""
+    result = json.loads(export_video(scenes=["Nope"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_export_video_invalid_transition(tmp_path):
+    """Verify export_video rejects unsupported transitions."""
+    result = json.loads(
+        export_video(
+            scenes=["Intro"],
+            transition="wipe",
+            workspace_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert "Invalid transition 'wipe'" in result["error"]
+
+
+def test_export_video_missing_ffmpeg(monkeypatch, tmp_path):
+    """Verify export_video fails fast with an actionable ffmpeg error."""
+    _write_scene_config(
+        tmp_path,
+        "Intro",
+        [{"type": "video", "file": "slides/files/Intro/0.mp4"}],
+    )
+    monkeypatch.setattr("mcp_manim_slides.server._ffmpeg_executable", lambda: None)
+    result = json.loads(export_video(scenes=["Intro"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "ffmpeg executable not found" in result["error"]
+
+
+def test_playwright_availability_error_resolves(monkeypatch):
+    """Verify availability check passes when playwright is importable."""
+    monkeypatch.setattr("mcp_manim_slides.server.shutil.which", lambda _name: None)
+    monkeypatch.setattr("mcp_manim_slides.server._module_available", lambda _name: True)
+    assert _playwright_availability_error() is None
+
+
+def test_playwright_availability_error_reports(monkeypatch):
+    """Verify availability check reports a clear error when playwright is absent."""
+    monkeypatch.setattr("mcp_manim_slides.server.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._module_available", lambda _name: False
+    )
+    error = _playwright_availability_error()
+    assert error is not None
+    assert "playwright is not installed" in error
+    assert 'pip install "mcp-manim-slides[vision]"' in error
+    assert "playwright install chromium" in error
+
+
+def test_capture_deck_screenshots_requires_playwright(monkeypatch, tmp_path):
+    """Verify the capture helper raises an actionable error without playwright."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name.startswith("playwright"):
+            raise ImportError("no playwright")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError, match="playwright"):
+        _capture_deck_screenshots(
+            url="http://127.0.0.1:1/deck.html",
+            output_dir=tmp_path,
+            slides=None,
+            width=640,
+            height=360,
+            output_format="png",
+            timeout=5,
+        )
+
+
+def test_screenshot_deck_playwright_missing(monkeypatch, tmp_path):
+    """Verify screenshot_deck fails fast when playwright is not installed."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    monkeypatch.setattr("mcp_manim_slides.server.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._module_available", lambda _name: False
+    )
+    result = json.loads(screenshot_deck(dest="deck.html", workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "playwright install chromium" in result["error"]
+
+
+def test_screenshot_deck_success_fake_capture(monkeypatch, tmp_path):
+    """Verify screenshot_deck serves the deck and reports captured slides."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    calls: dict = {}
+
+    def fake_capture(**kwargs):
+        calls.update(kwargs)
+        out_dir = kwargs["output_dir"]
+        indices = kwargs["slides"] if kwargs["slides"] is not None else [0]
+        return [
+            {
+                "index": index,
+                "slide_path": str((out_dir / f"deck_slide_{index}.png").resolve()),
+            }
+            for index in indices
+        ]
+
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._capture_deck_screenshots", fake_capture
+    )
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._playwright_availability_error",
+        lambda: None,
+    )
+    result = json.loads(
+        screenshot_deck(
+            dest="deck.html",
+            workspace_dir=str(tmp_path),
+            slides=[0, 1],
+            output_dir="shots",
+            width=640,
+            height=360,
+            output_format="png",
+            timeout=30,
+        )
+    )
+    assert result["success"] is True
+    assert result["count"] == 2
+    assert result["slides"][0]["index"] == 0
+    assert result["slides"][1]["index"] == 1
+    assert result["output_dir"] == str((tmp_path / "shots").resolve())
+    assert result["url"].endswith("/deck.html")
+    assert (tmp_path / "shots").is_dir()
+    assert calls["url"] == result["url"]
+    assert calls["slides"] == [0, 1]
+    assert calls["width"] == 640
+    assert calls["height"] == 360
+    assert calls["output_format"] == "png"
+    assert calls["timeout"] == 30
+
+
+def test_screenshot_deck_bad_output_format(tmp_path):
+    """Verify screenshot_deck rejects unsupported output formats."""
+    (tmp_path / "deck.html").write_text("<html>deck</html>")
+    result = json.loads(
+        screenshot_deck(
+            dest="deck.html", workspace_dir=str(tmp_path), output_format="gif"
+        )
+    )
+    assert result["success"] is False
+    assert "Unsupported output_format" in result["error"]
+
+
+def test_screenshot_deck_missing_dest(tmp_path):
+    """Verify screenshot_deck reports an error for a missing deck."""
+    result = json.loads(screenshot_deck(dest="nope.html", workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_screenshot_deck_rejects_non_html(tmp_path):
+    """Verify screenshot_deck rejects a non-HTML file."""
+    (tmp_path / "deck.pdf").write_text("not html")
+    result = json.loads(screenshot_deck(dest="deck.pdf", workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert ".html" in result["error"]
+
+
+def test_build_contact_sheet_command_divisible():
+    """Verify a divisible frame count produces a filler-free grid command."""
+    frames = [f"frame_{index}.png" for index in range(4)]
+    command = _build_contact_sheet_command(
+        frames, dest="sheet.png", columns=2, tile_width=640
+    )
+    assert command[0] == "ffmpeg"
+    assert "lavfi" not in command
+    assert sum(1 for arg in command if arg == "-i") == 4
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "hstack=inputs=2" in filter_complex
+    assert "vstack=inputs=2" in filter_complex
+    assert "color=black" not in filter_complex
+    assert command[-1] == "sheet.png"
+
+
+def test_build_contact_sheet_command_fills_last_row():
+    """Verify black filler tiles complete a non-divisible last row."""
+    frames = [f"frame_{index}.png" for index in range(5)]
+    command = _build_contact_sheet_command(
+        frames, dest="sheet.png", columns=3, tile_width=320
+    )
+    fillers = [arg for arg in command if arg.startswith("color=black")]
+    assert fillers == ["color=black:s=320x180"]
+    assert sum(1 for arg in command if arg == "-i") == 6
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "hstack=inputs=3" in filter_complex
+    assert "vstack=inputs=2" in filter_complex
+
+
+def test_build_contact_sheet_command_single_tile():
+    """Verify a single tile maps directly without stacking filters."""
+    command = _build_contact_sheet_command(
+        ["only.png"], dest="sheet.png", columns=1, tile_width=320
+    )
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "hstack" not in filter_complex
+    assert "vstack" not in filter_complex
+    assert command[command.index("-map") + 1] == "[t0]"
+
+
+def test_build_contact_sheet_command_rejects_invalid_input():
+    """Verify invalid grid arguments are rejected before any ffmpeg run."""
+    with pytest.raises(ValueError):
+        _build_contact_sheet_command([], dest="sheet.png", columns=3, tile_width=320)
+    with pytest.raises(ValueError):
+        _build_contact_sheet_command(
+            ["only.png"], dest="sheet.png", columns=0, tile_width=320
+        )
+
+
+def test_contact_sheet_success(monkeypatch, tmp_path):
+    """Verify contact_sheet composes a grid of slide frames via ffmpeg."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [
+            {"type": "video", "file": "slides/files/MySlide/0.mp4"},
+            {"type": "video", "file": "slides/files/MySlide/1.mp4"},
+        ],
+    )
+    captured: dict[str, list] = {}
+
+    def fake_run(command, **kwargs):
+        captured.setdefault("commands", []).append(list(command))
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake-frame")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+    result = json.loads(
+        contact_sheet(
+            scenes=["MySlide"],
+            dest="sheet.png",
+            workspace_dir=str(tmp_path),
+            columns=2,
+            tile_width=320,
+        )
+    )
+    assert result["success"] is True
+    assert result["dest"] == str((tmp_path / "sheet.png").resolve())
+    assert result["rows"] == 1
+    assert result["columns"] == 2
+    assert result["slide_count"] == 2
+    assert result["command"][0] == "/usr/bin/ffmpeg"
+    assert len(captured["commands"]) == 3
+    compose = captured["commands"][-1]
+    assert compose[0] == "/usr/bin/ffmpeg"
+    assert "color=black" not in compose
+    filter_complex = compose[compose.index("-filter_complex") + 1]
+    assert "hstack=inputs=2" in filter_complex
+
+
+def test_contact_sheet_all_scenes_with_filler(monkeypatch, tmp_path):
+    """Verify scenes=None includes every scene and pads the grid."""
+    _write_scene_config(
+        tmp_path,
+        "First",
+        [{"type": "video", "file": "slides/files/First/0.mp4"}],
+    )
+    _write_scene_config(
+        tmp_path,
+        "Second",
+        [
+            {"type": "video", "file": "slides/files/Second/0.mp4"},
+            {"type": "video", "file": "slides/files/Second/1.mp4"},
+        ],
+    )
+    captured: dict[str, list] = {}
+
+    def fake_run(command, **kwargs):
+        captured.setdefault("commands", []).append(list(command))
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("fake-frame")
+        return _FakeCompletedProcess(0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+    result = json.loads(
+        contact_sheet(
+            dest="sheet.png",
+            workspace_dir=str(tmp_path),
+            columns=2,
+            tile_width=320,
+        )
+    )
+    assert result["success"] is True
+    assert result["slide_count"] == 3
+    assert result["rows"] == 2
+    compose = captured["commands"][-1]
+    assert any(arg.startswith("color=black") for arg in compose)
+
+
+def test_contact_sheet_ffmpeg_failure(monkeypatch, tmp_path):
+    """Verify contact_sheet surfaces the ffmpeg error on failure."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeCompletedProcess(1, stderr="bogus filter"),
+    )
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: "/usr/bin/ffmpeg",
+    )
+    result = json.loads(contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "bogus filter" in result["error"]
+
+
+def test_contact_sheet_ffmpeg_missing(monkeypatch, tmp_path):
+    """Verify contact_sheet reports an error when ffmpeg is unavailable."""
+    _write_scene_config(
+        tmp_path,
+        "MySlide",
+        [{"type": "video", "file": "slides/files/MySlide/0.mp4"}],
+    )
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._ffmpeg_executable",
+        lambda: None,
+    )
+    result = json.loads(contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "ffmpeg executable not found" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_export_video():
+    """Verify export_video tool is registered on the MCPServer."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "export_video" in tool_names
+
+    export_tool = next(t for t in tools if t.name == "export_video")
+    assert "MP4" in export_tool.description
+    assert "scenes" in export_tool.input_schema["properties"]
+    assert "transition" in export_tool.input_schema["properties"]
+    assert "image_duration" in export_tool.input_schema["properties"]
+
+
+def test_contact_sheet_missing_scene(tmp_path):
+    """Verify contact_sheet reports an error when the scene is not found."""
+    result = json.loads(contact_sheet(scenes=["Nope"], workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+def test_contact_sheet_no_scenes(tmp_path):
+    """Verify contact_sheet reports an error when no scenes are rendered."""
+    result = json.loads(contact_sheet(workspace_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "No rendered scenes found" in result["error"]
+
+
+def test_contact_sheet_invalid_columns(tmp_path):
+    """Verify contact_sheet rejects invalid grid arguments before ffmpeg."""
+    result = json.loads(contact_sheet(workspace_dir=str(tmp_path), columns=0))
+    assert result["success"] is False
+    assert "columns" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_screenshot_and_contact():
+    """Verify screenshot_deck and contact_sheet tools are registered."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "screenshot_deck" in tool_names
+    assert "contact_sheet" in tool_names
+
+    screenshot_tool = next(t for t in tools if t.name == "screenshot_deck")
+    assert "dest" in screenshot_tool.input_schema["properties"]
+    assert "slides" in screenshot_tool.input_schema["properties"]
+    assert "output_format" in screenshot_tool.input_schema["properties"]
+
+    contact_tool = next(t for t in tools if t.name == "contact_sheet")
+    assert "columns" in contact_tool.input_schema["properties"]
+    assert "tile_width" in contact_tool.input_schema["properties"]

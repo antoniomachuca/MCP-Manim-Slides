@@ -21,12 +21,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ALL_TOOL_NAMES = {
     "hello_world",
     "execute_manim_code",
+    "sync_deck",
     "compile_presentation",
     "export_revealjs_html",
+    "export_video",
     "list_scenes",
     "preview_slide",
     "serve_revealjs_html",
     "stop_preview_server",
+    "screenshot_deck",
+    "contact_sheet",
 }
 
 
@@ -91,6 +95,16 @@ async def test_call_execute_manim_code_syntax_error(mcp_client):
 
 
 @pytest.mark.anyio
+async def test_call_sync_deck_syntax_error(mcp_client):
+    """Verify sync_deck fails fast with a clean error over the transport."""
+    result = await mcp_client.call_tool("sync_deck", {"code": "def broken(:\n"})
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "SyntaxError" in payload["error"]
+
+
+@pytest.mark.anyio
 async def test_call_list_scenes_missing_folder(mcp_client, tmp_path):
     """Verify list_scenes reports a missing workspace folder over the transport."""
     result = await mcp_client.call_tool("list_scenes", {"workspace_dir": str(tmp_path)})
@@ -105,6 +119,18 @@ async def test_call_preview_slide_missing_scene(mcp_client, tmp_path):
     """Verify preview_slide reports a missing scene over the transport."""
     result = await mcp_client.call_tool(
         "preview_slide", {"scene": "Nope", "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_export_video_missing_scene(mcp_client, tmp_path):
+    """Verify export_video returns clean failure JSON for a missing scene."""
+    result = await mcp_client.call_tool(
+        "export_video", {"scenes": ["Nope"], "workspace_dir": str(tmp_path)}
     )
     assert not result.is_error
     payload = json.loads(result.content[0].text)
@@ -133,3 +159,65 @@ async def test_serve_and_stop_preview_server(mcp_client, tmp_path):
     assert not stop.is_error
     stopped = json.loads(stop.content[0].text)
     assert served["port"] in stopped["stopped_ports"]
+
+
+ALL_PROMPT_NAMES = {
+    "title_slide",
+    "agenda",
+    "code_walkthrough",
+    "math_derivation",
+    "two_column_comparison",
+}
+
+
+@pytest.mark.anyio
+async def test_list_prompts(mcp_client):
+    """Verify all slide-archetype prompts are exposed over the transport."""
+    prompts = await mcp_client.list_prompts()
+    names = {prompt.name for prompt in prompts.prompts}
+    assert ALL_PROMPT_NAMES <= names
+
+
+@pytest.mark.anyio
+async def test_get_prompt_round_trip(mcp_client):
+    """Verify a prompt renders its arguments over the real stdio transport."""
+    result = await mcp_client.get_prompt(
+        "title_slide",
+        {"title": "Integration Deck", "subtitle": "Over the wire"},
+    )
+    text = result.messages[0].content.text
+    assert "Integration Deck" in text
+    assert "Over the wire" in text
+
+
+@pytest.mark.anyio
+async def test_get_prompt_multi_value_round_trip(mcp_client):
+    """Verify comma-separated prompt arguments parse over the transport."""
+    result = await mcp_client.get_prompt("agenda", {"topics": "Intro, Demo"})
+    text = result.messages[0].content.text
+    assert "1. Intro" in text
+    assert "2. Demo" in text
+
+
+@pytest.mark.anyio
+async def test_call_contact_sheet_missing_scene(mcp_client, tmp_path):
+    """Verify contact_sheet reports a missing scene over the transport."""
+    result = await mcp_client.call_tool(
+        "contact_sheet", {"scenes": ["Nope"], "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_call_screenshot_deck_missing_deck(mcp_client, tmp_path):
+    """Verify screenshot_deck reports a missing deck before touching a browser."""
+    result = await mcp_client.call_tool(
+        "screenshot_deck", {"dest": "nope.html", "workspace_dir": str(tmp_path)}
+    )
+    assert not result.is_error
+    payload = json.loads(result.content[0].text)
+    assert payload["success"] is False
+    assert "not found" in payload["error"]

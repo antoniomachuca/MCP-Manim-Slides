@@ -11,6 +11,7 @@ import ast
 import asyncio
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -99,7 +100,8 @@ def slides_list() -> str:
             {
                 "success": False,
                 "error": f"Slides folder not found: {folder_path}",
-            }
+            },
+            indent=2,
         )
     scenes = _collect_scene_metadata(folder_path)
     return json.dumps(
@@ -171,6 +173,25 @@ def _manim_slides_availability_error() -> str | None:
     )
 
 
+def _playwright_availability_error() -> str | None:
+    """Return a clear error if Playwright cannot be used, else None.
+
+    Checks both the ``playwright`` console script and the ``playwright``
+    Python module so deck screenshot capture fails fast with an actionable
+    message instead of an opaque import error when the optional vision
+    dependency is missing from the environment.
+    """
+    if shutil.which("playwright") is not None:
+        return None
+    if _module_available("playwright"):
+        return None
+    return (
+        "playwright is not installed in the current environment. "
+        "Install it with 'pip install \"mcp-manim-slides[vision]\"' then "
+        "'playwright install chromium' to capture deck screenshots."
+    )
+
+
 def _validate_python_syntax(code: str) -> str | None:
     """Return a clear error message for invalid Python code, or None.
 
@@ -185,6 +206,57 @@ def _validate_python_syntax(code: str) -> str | None:
     except (ValueError, TypeError) as exc:
         return f"Invalid Python code: {exc}"
     return None
+
+
+def _extract_scene_fragments(code: str) -> tuple[str, dict[str, str]]:
+    """Split ``code`` into a module preamble and per-scene class sources.
+
+    Uses :mod:`ast` to locate top-level ``ClassDef`` nodes (the Manim
+    Scene/Slide classes) and captures each class body with
+    ``ast.get_source_segment`` (including its decorator lines). Everything
+    outside those classes — imports, shared helpers, module-level setup — is
+    returned as the module preamble so that shared code is part of every
+    scene's cache identity.
+
+    The preamble is normalized (blank lines dropped, trailing whitespace
+    stripped) so that adding, removing, or reordering scene classes does not
+    change the preamble and therefore never invalidates the remaining scenes'
+    cache entries.
+
+    Args:
+        code: Python source code defining one or more Manim Scene/Slide classes.
+
+    Returns:
+        A ``(preamble, fragments)`` tuple where ``fragments`` maps each class
+        name to its source. Invalid code returns ``("", {})`` — callers are
+        expected to pre-validate syntax (see ``_validate_python_syntax``).
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return "", {}
+    lines = code.splitlines(keepends=True)
+    fragments: dict[str, str] = {}
+    preamble_lines: list[str] = []
+    index = 0
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        start = node.lineno - 1
+        if node.decorator_list:
+            start = node.decorator_list[0].lineno - 1
+        end = node.end_lineno or node.lineno
+        segment = ast.get_source_segment(code, node)
+        if segment is None:
+            segment = "".join(lines[start:end]).rstrip("\n")
+        elif node.decorator_list:
+            segment = "".join(lines[start : node.lineno - 1]) + segment
+        fragments[node.name] = segment
+        preamble_lines.extend(line for line in lines[index:start] if line.strip())
+        index = end
+    preamble_lines.extend(line for line in lines[index:] if line.strip())
+    preamble = "\n".join(line.rstrip() for line in preamble_lines)
+    return preamble, fragments
 
 
 _MODULE_NOT_FOUND_RE = re.compile(
@@ -375,7 +447,7 @@ def _run_convert(
     """Run a ``manim-slides convert`` command and return a structured JSON result."""
     availability_error = _manim_slides_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
     try:
         result = subprocess.run(
             command,
@@ -402,21 +474,24 @@ def _run_convert(
             {
                 "success": False,
                 "error": f"Conversion timed out after {timeout}s: {e}",
-            }
+            },
+            indent=2,
         )
     except FileNotFoundError as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"manim-slides executable not found: {e}",
-            }
+            },
+            indent=2,
         )
     except Exception as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Error executing convert tool: {e}",
-            }
+            },
+            indent=2,
         )
 
 
@@ -522,7 +597,7 @@ def export_revealjs_html(
     """
     error = _validate_reveal_options(theme, transition, transition_speed)
     if error:
-        return json.dumps({"success": False, "error": error})
+        return json.dumps({"success": False, "error": error}, indent=2)
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     command = _build_revealjs_export_command(
         scenes=scenes,
@@ -617,14 +692,16 @@ def serve_revealjs_html(
             {
                 "success": False,
                 "error": f"HTML deck not found: {dest_path}",
-            }
+            },
+            indent=2,
         )
     if dest_path.suffix.lower() != ".html":
         return json.dumps(
             {
                 "success": False,
                 "error": f"Expected an .html file, got: {dest_path}",
-            }
+            },
+            indent=2,
         )
 
     try:
@@ -641,7 +718,8 @@ def serve_revealjs_html(
             {
                 "success": False,
                 "error": f"Failed to start preview server: {e}",
-            }
+            },
+            indent=2,
         )
 
     url = f"http://{host}:{bound_port}/{url_path}"
@@ -715,6 +793,230 @@ def stop_preview_server(port: int | None = None) -> str:
     )
 
 
+SCREENSHOT_FORMATS = {"png", "jpg", "webp"}
+
+
+def _capture_deck_screenshots(
+    url: str,
+    output_dir: Path,
+    slides: list[int] | None,
+    width: int,
+    height: int,
+    output_format: str,
+    timeout: int,
+) -> list[dict]:
+    """Capture screenshots of Reveal.js deck slides with a headless browser.
+
+    Launches headless Chromium via Playwright, navigates to the served deck,
+    waits for Reveal.js readiness, and screenshots each target slide's
+    ``.reveal`` element into ``output_dir``.
+
+    Args:
+        url: URL of the served Reveal.js deck.
+        output_dir: Directory where the screenshot files are written.
+        slides: Zero-based slide indices to capture. When None, every slide
+            in the deck is captured (falling back to a single slide when the
+            deck reports no slides).
+        width: Viewport width in pixels.
+        height: Viewport height in pixels.
+        output_format: Image format: "png", "jpg", or "webp".
+        timeout: Maximum time in seconds for each browser operation.
+
+    Returns:
+        A list of ``{"index": i, "slide_path": <abs path>}`` dicts, one per
+        captured slide, in slide order.
+
+    Raises:
+        RuntimeError: If Playwright is not installed or the capture fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        raise RuntimeError(
+            _playwright_availability_error()
+            or "playwright is not installed in the current environment."
+        ) from e
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    captured: list[dict] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(
+                    viewport={"width": width, "height": height},
+                )
+                page.goto(url, timeout=timeout * 1000)
+                try:
+                    page.wait_for_function(
+                        "window.Reveal && Reveal.isReady && Reveal.isReady()",
+                        timeout=min(5000, timeout * 1000),
+                    )
+                except Exception:
+                    page.wait_for_timeout(1500)
+                if slides is None:
+                    total = page.evaluate("Reveal.getTotalSlides()")
+                    try:
+                        total = int(total)
+                    except (TypeError, ValueError):
+                        total = 0
+                    indices = list(range(total)) if total > 0 else [0]
+                else:
+                    indices = list(slides)
+                for index in indices:
+                    page.evaluate(f"Reveal.slide({index})")
+                    page.wait_for_timeout(300)
+                    slide_path = output_dir / f"deck_slide_{index}.{output_format}"
+                    try:
+                        page.locator(".reveal").screenshot(
+                            path=str(slide_path),
+                            timeout=timeout * 1000,
+                        )
+                    except Exception:
+                        page.screenshot(
+                            path=str(slide_path),
+                            timeout=timeout * 1000,
+                        )
+                    captured.append(
+                        {
+                            "index": index,
+                            "slide_path": str(slide_path.resolve()),
+                        }
+                    )
+            finally:
+                browser.close()
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Deck screenshot capture failed: {e}") from e
+    return captured
+
+
+@mcp.tool()
+def screenshot_deck(
+    dest: str,
+    workspace_dir: str | None = None,
+    slides: list[int] | None = None,
+    output_dir: str = "screenshots",
+    width: int = 1920,
+    height: int = 1080,
+    output_format: str = "png",
+    timeout: int = 120,
+) -> str:
+    """Capture screenshots of an exported Reveal.js deck's slides headlessly.
+
+    Serves the deck's directory on a local HTTP server (reusing the ephemeral
+    preview server registry) and captures one screenshot per slide with a
+    headless browser, so an AI agent can "see" its own deck. Requires the
+    optional Playwright vision extra (``mcp-manim-slides[vision]``).
+
+    Args:
+        dest: Path to the exported HTML deck (e.g., "presentation.html").
+            Resolved relative to ``workspace_dir`` when not absolute.
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        slides: Zero-based slide indices to capture. When omitted, every
+            slide in the deck is captured.
+        output_dir: Directory for the screenshot files (default "screenshots"),
+            resolved under the workspace.
+        width: Viewport width in pixels (default 1920).
+        height: Viewport height in pixels (default 1080).
+        output_format: Image format: "png", "jpg", or "webp". Defaults to "png".
+        timeout: Maximum time in seconds for browser navigation and capture.
+
+    Returns:
+        A JSON string with the served deck URL, the absolute output directory,
+        and the captured slide screenshot paths.
+    """
+    output_format = output_format.lower()
+    if output_format not in SCREENSHOT_FORMATS:
+        supported = ", ".join(sorted(SCREENSHOT_FORMATS))
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Unsupported output_format '{output_format}'. "
+                    f"Valid formats: {supported}."
+                ),
+            },
+            indent=2,
+        )
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR") or "."
+    workspace = Path(cwd).resolve()
+    dest_path = Path(dest)
+    if not dest_path.is_absolute():
+        dest_path = (workspace / dest_path).resolve()
+
+    if not dest_path.is_file():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"HTML deck not found: {dest_path}",
+            },
+            indent=2,
+        )
+    if dest_path.suffix.lower() != ".html":
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Expected an .html file, got: {dest_path}",
+            },
+            indent=2,
+        )
+
+    availability_error = _playwright_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
+
+    try:
+        url_path = dest_path.relative_to(workspace).as_posix()
+        serve_dir = workspace
+    except ValueError:
+        url_path = dest_path.name
+        serve_dir = dest_path.parent
+
+    try:
+        _, bound_port, _ = _start_preview_server(serve_dir, "127.0.0.1", None)
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to start preview server: {e}",
+            },
+            indent=2,
+        )
+
+    url = f"http://127.0.0.1:{bound_port}/{url_path}"
+    shots_dir = Path(output_dir)
+    if not shots_dir.is_absolute():
+        shots_dir = workspace / shots_dir
+
+    try:
+        shots_dir.mkdir(parents=True, exist_ok=True)
+        captured = _capture_deck_screenshots(
+            url=url,
+            output_dir=shots_dir,
+            slides=slides,
+            width=width,
+            height=height,
+            output_format=output_format,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+    return json.dumps(
+        {
+            "success": True,
+            "url": url,
+            "output_dir": str(shots_dir.resolve()),
+            "slides": captured,
+            "count": len(captured),
+        },
+        indent=2,
+    )
+
+
 PREVIEW_IMAGE_FORMATS = {"png", "jpg", "jpeg", "webp"}
 PREVIEW_VIDEO_FORMATS = {"mp4", "gif"}
 
@@ -727,6 +1029,42 @@ GIF_FILTER = (
 def _ffmpeg_executable() -> str | None:
     """Return the path to the ffmpeg executable, or None if unavailable."""
     return shutil.which("ffmpeg")
+
+
+def _ffprobe_duration(path: str | Path) -> float | None:
+    """Return the media duration in seconds reported by ffprobe, or None.
+
+    Args:
+        path: Path to the media file to probe.
+
+    Returns:
+        The duration in seconds, or None when ffprobe is unavailable, the
+        probe fails, or the output cannot be parsed as a number.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _load_scene_config(folder_path: Path, scene: str) -> dict | None:
@@ -798,7 +1136,8 @@ def list_scenes(folder: str = "slides", workspace_dir: str | None = None) -> str
             {
                 "success": False,
                 "error": f"Slides folder not found: {folder_path}",
-            }
+            },
+            indent=2,
         )
     scenes = _collect_scene_metadata(folder_path)
     return json.dumps(
@@ -850,7 +1189,8 @@ def preview_slide(
                     f"Unsupported output_format '{output_format}'. "
                     f"Valid formats: {', '.join(supported)}."
                 ),
-            }
+            },
+            indent=2,
         )
     cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
     folder_path = Path(cwd or ".").joinpath(folder)
@@ -860,7 +1200,8 @@ def preview_slide(
             {
                 "success": False,
                 "error": f"Scene '{scene}' not found in {folder_path}.",
-            }
+            },
+            indent=2,
         )
     slides = data.get("slides", [])
     if not 0 <= slide_index < len(slides):
@@ -871,7 +1212,8 @@ def preview_slide(
                     f"Slide index {slide_index} out of range "
                     f"(scene '{scene}' has {len(slides)} slides)."
                 ),
-            }
+            },
+            indent=2,
         )
     slide = slides[slide_index]
     media = _resolve_slide_media(cwd, slide)
@@ -880,7 +1222,8 @@ def preview_slide(
             {
                 "success": False,
                 "error": f"Slide media file not found: {slide.get('file')}",
-            }
+            },
+            indent=2,
         )
     slide_type = slide.get("type")
     if slide_type == "image" and output_format in PREVIEW_VIDEO_FORMATS:
@@ -891,7 +1234,8 @@ def preview_slide(
                     f"Cannot preview image slide as '{output_format}'. "
                     "Use an image format (png/jpg/webp) instead."
                 ),
-            }
+            },
+            indent=2,
         )
 
     preview_dir = Path(cwd or ".").joinpath("preview")
@@ -943,7 +1287,8 @@ def preview_slide(
                         "ffmpeg executable not found. "
                         "Install FFmpeg to generate previews."
                     ),
-                }
+                },
+                indent=2,
             )
         command[0] = ffmpeg
         try:
@@ -958,7 +1303,8 @@ def preview_slide(
                 {
                     "success": False,
                     "error": f"Preview generation timed out after {timeout}s: {e}",
-                }
+                },
+                indent=2,
             )
         if result.returncode != 0:
             return json.dumps(
@@ -967,7 +1313,8 @@ def preview_slide(
                     "error": (
                         result.stderr.strip() or "Unknown preview generation error."
                     ),
-                }
+                },
+                indent=2,
             )
     else:
         shutil.copyfile(media, destination)
@@ -983,6 +1330,793 @@ def preview_slide(
         },
         indent=2,
     )
+
+
+def _build_contact_sheet_command(
+    frame_paths: list[str],
+    dest: str,
+    columns: int,
+    tile_width: int,
+    tile_height: int | None = None,
+) -> list[str]:
+    """Build the ffmpeg command that montages slide frames into a grid image.
+
+    Each frame is letterboxed into a common tile size (``tile_width`` by
+    ``tile_height``, scaled with its aspect ratio preserved and padded with
+    black) and arranged row-major with ``columns`` tiles per row. When the
+    frame count is not divisible by ``columns``, black filler tiles complete
+    the last row.
+
+    Args:
+        frame_paths: Paths of the extracted slide frames, in slide order.
+        dest: Output path for the composed contact sheet image.
+        columns: Number of tiles per row (at least 1).
+        tile_width: Width in pixels of each tile.
+        tile_height: Height in pixels of each tile. When None, a 16:9 tile
+            height is derived from ``tile_width``.
+
+    Returns:
+        The ffmpeg argument list, with ``"ffmpeg"`` as the executable
+        placeholder at index 0.
+
+    Raises:
+        ValueError: If ``frame_paths`` is empty or ``columns`` is below 1.
+    """
+    if not frame_paths:
+        raise ValueError("frame_paths must not be empty.")
+    if columns < 1:
+        raise ValueError("columns must be at least 1.")
+    if tile_height is None:
+        tile_height = max(2, tile_width * 9 // 16)
+    count = len(frame_paths)
+    rows = (count + columns - 1) // columns
+    total = rows * columns
+    command = ["ffmpeg", "-y"]
+    filters: list[str] = []
+    for index in range(total):
+        if index < count:
+            command += ["-i", frame_paths[index]]
+            filters.append(
+                f"[{index}:v]scale={tile_width}:{tile_height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={tile_width}:{tile_height}:(ow-iw)/2:(oh-ih)/2,"
+                f"format=rgb24[t{index}]"
+            )
+        else:
+            command += [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=black:s={tile_width}x{tile_height}",
+            ]
+            filters.append(f"[{index}:v]format=rgb24[t{index}]")
+    row_labels: list[str] = []
+    for row in range(rows):
+        tiles = [f"t{row * columns + col}" for col in range(columns)]
+        if columns == 1:
+            row_labels.append(tiles[0])
+        else:
+            chain = "".join(f"[{tile}]" for tile in tiles)
+            filters.append(f"{chain}hstack=inputs={columns}[row{row}]")
+            row_labels.append(f"row{row}")
+    if rows == 1:
+        out_label = row_labels[0]
+    else:
+        chain = "".join(f"[{label}]" for label in row_labels)
+        filters.append(f"{chain}vstack=inputs={rows}[out]")
+        out_label = "out"
+    command += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        f"[{out_label}]",
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        dest,
+    ]
+    return command
+
+
+@mcp.tool()
+def contact_sheet(
+    scenes: list[str] | None = None,
+    dest: str = "contact_sheet.png",
+    folder: str = "slides",
+    workspace_dir: str | None = None,
+    columns: int = 3,
+    tile_width: int = 640,
+    timeout: int = 300,
+) -> str:
+    """Compose a grid contact sheet of slide frames using FFmpeg only.
+
+    Extracts one representative frame per slide (via the ffmpeg ``thumbnail``
+    filter) and montages the frames into a single grid image, so an AI agent
+    can review an entire deck at a glance without any browser or extra
+    dependencies. Black filler tiles complete the last row when the slide
+    count is not divisible by ``columns``.
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in
+            order. When omitted, every scene in ``folder`` is included.
+        dest: Destination path for the contact sheet image
+            (e.g., "contact_sheet.png"). Resolved under the workspace.
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        columns: Number of tiles per grid row (default 3).
+        tile_width: Width in pixels of each tile (default 640).
+        timeout: Maximum time in seconds for each ffmpeg invocation.
+
+    Returns:
+        A JSON string with the contact sheet destination, grid dimensions,
+        slide count, and the executed ffmpeg command.
+    """
+    if columns < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid columns {columns}. Must be at least 1.",
+            },
+            indent=2,
+        )
+    if tile_width < 2:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid tile_width {tile_width}. Must be at least 2.",
+            },
+            indent=2,
+        )
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+    metadata = _collect_scene_metadata(folder_path)
+    by_name = {entry["scene"]: entry for entry in metadata}
+    if scenes is None:
+        selected = metadata
+        if not selected:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"No rendered scenes found in {folder_path}.",
+                },
+                indent=2,
+            )
+    else:
+        selected = []
+        for name in scenes:
+            entry = by_name.get(name)
+            if entry is None:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Scene '{name}' not found in {folder_path}.",
+                    },
+                    indent=2,
+                )
+            selected.append(entry)
+
+    media_files: list[Path] = []
+    for entry in selected:
+        for slide in entry["slides"]:
+            media = _resolve_slide_media(cwd, slide)
+            if media is None or not media.is_file():
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Slide media file not found: {slide.get('file')}",
+                    },
+                    indent=2,
+                )
+            media_files.append(media)
+    if not media_files:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"No slides found in {folder_path}.",
+            },
+            indent=2,
+        )
+
+    ffmpeg = _ffmpeg_executable()
+    if ffmpeg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "ffmpeg executable not found. "
+                    "Install FFmpeg to generate contact sheets."
+                ),
+            },
+            indent=2,
+        )
+
+    tile_height: int | None = None
+    for entry in selected:
+        resolution = entry.get("resolution")
+        if (
+            isinstance(resolution, list)
+            and len(resolution) == 2
+            and all(isinstance(v, (int, float)) and v > 0 for v in resolution)
+        ):
+            tile_height = max(2, round(tile_width * resolution[1] / resolution[0]))
+            break
+
+    destination = Path(cwd or ".").joinpath(dest).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="contact_sheet_") as tmp:
+        frame_paths: list[str] = []
+        for index, media in enumerate(media_files):
+            frame_path = Path(tmp) / f"slide_{index:04d}.png"
+            command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(media),
+                "-vf",
+                "thumbnail",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                str(frame_path),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Contact sheet generation timed out after {timeout}s: {e}"
+                        ),
+                    },
+                    indent=2,
+                )
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            result.stderr.strip()
+                            or "Unknown contact sheet generation error."
+                        ),
+                    },
+                    indent=2,
+                )
+            frame_paths.append(str(frame_path))
+
+        command = _build_contact_sheet_command(
+            frame_paths=frame_paths,
+            dest=str(destination),
+            columns=columns,
+            tile_width=tile_width,
+            tile_height=tile_height,
+        )
+        command[0] = ffmpeg
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Contact sheet generation timed out after {timeout}s: {e}"
+                    ),
+                },
+                indent=2,
+            )
+        if result.returncode != 0:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        result.stderr.strip()
+                        or "Unknown contact sheet generation error."
+                    ),
+                },
+                indent=2,
+            )
+
+    rows = (len(media_files) + columns - 1) // columns
+    return json.dumps(
+        {
+            "success": True,
+            "dest": str(destination),
+            "rows": rows,
+            "columns": columns,
+            "slide_count": len(media_files),
+            "command": command,
+        },
+        indent=2,
+    )
+
+
+EXPORT_TRANSITIONS = ("none", "fade")
+
+
+def _concat_list_text(segments: list[str]) -> str:
+    """Return the ffmpeg concat demuxer list-file content for ``segments``.
+
+    Args:
+        segments: Segment file paths to concatenate, in playback order.
+
+    Returns:
+        The text of a concat demuxer list file with one ``file`` directive
+        per segment.
+    """
+    return "".join(f"file '{segment}'\n" for segment in segments)
+
+
+def _build_export_command(
+    media: list[dict],
+    dest: str,
+    width: int,
+    height: int,
+    segment_paths: list[str],
+    fps: int = 30,
+    transition: str = "none",
+    transition_duration: float = 0.5,
+    image_duration: float = 2.0,
+    concat_list_path: str = "concat.txt",
+    durations: list[float] | None = None,
+) -> list[list[str]]:
+    """Build the ffmpeg command pipeline that exports slides to one video.
+
+    Every slide is normalized to an intermediate segment (libx264, yuv420p,
+    shared frame size and rate) with letterbox padding; still-image slides
+    become fixed-duration segments via ``-loop 1``. The segments are then
+    assembled with the concat demuxer (``transition="none"``) or an xfade
+    crossfade chain (``transition="fade"``).
+
+    Args:
+        media: Slides to export, in playback order. Each entry is a dict with
+            "path" (media file) and "type" ("image" for still-image slides).
+        dest: Destination path for the exported video.
+        width: Target frame width in pixels.
+        height: Target frame height in pixels.
+        segment_paths: Output path for each normalized intermediate segment,
+            one per entry in ``media``.
+        fps: Target frame rate for the normalized segments.
+        transition: Assembly mode: "none" (hard cuts) or "fade" (crossfades).
+        transition_duration: Duration in seconds of each crossfade.
+        image_duration: Duration in seconds for still-image slides.
+        concat_list_path: Path of the concat demuxer list file used when
+            ``transition`` is "none".
+        durations: Duration in seconds of each normalized segment. Required
+            to compute xfade offsets when ``transition`` is "fade" and more
+            than one segment is exported.
+
+    Returns:
+        A list of ffmpeg argument lists: one normalization command per slide
+        followed by the final assembly command.
+
+    Raises:
+        ValueError: If ``media`` and ``segment_paths`` differ in length or the
+            fade offsets cannot be computed from ``durations``.
+    """
+    if len(media) != len(segment_paths):
+        raise ValueError("media and segment_paths must have the same length.")
+    normalize_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={fps}"
+    )
+    commands: list[list[str]] = []
+    for slide, segment in zip(media, segment_paths, strict=True):
+        command = ["ffmpeg", "-y"]
+        if slide.get("type") == "image":
+            command += ["-loop", "1", "-t", str(image_duration)]
+        command += [
+            "-i",
+            str(slide["path"]),
+            "-vf",
+            normalize_filter,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(segment),
+        ]
+        commands.append(command)
+
+    if transition == "none":
+        commands.append(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
+                "-c",
+                "copy",
+                str(dest),
+            ]
+        )
+        return commands
+
+    inputs: list[str] = []
+    for segment in segment_paths:
+        inputs += ["-i", str(segment)]
+    if len(segment_paths) == 1:
+        commands.append(["ffmpeg", "-y", *inputs, "-c", "copy", str(dest)])
+        return commands
+    if durations is None or len(durations) != len(segment_paths):
+        raise ValueError("durations are required to build fade transitions.")
+    filters = []
+    previous = "[0:v]"
+    for index in range(1, len(segment_paths)):
+        offset = sum(durations[:index]) - index * transition_duration
+        label = f"[x{index}]"
+        filters.append(
+            f"{previous}[{index}:v]xfade=transition=fade:"
+            f"duration={transition_duration}:offset={round(offset, 6)}{label}"
+        )
+        previous = label
+    commands.append(
+        [
+            "ffmpeg",
+            "-y",
+            *inputs,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            previous,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+        ]
+    )
+    return commands
+
+
+@mcp.tool()
+def export_video(
+    scenes: list[str],
+    dest: str = "presentation.mp4",
+    folder: str = "slides",
+    workspace_dir: str | None = None,
+    fps: int = 30,
+    width: int | None = None,
+    height: int | None = None,
+    transition: str = "none",
+    transition_duration: float = 0.5,
+    image_duration: float = 2.0,
+    timeout: int = 600,
+) -> str:
+    """Concatenate slide media across scenes into a single MP4 video.
+
+    Reads the rendered slide configurations for ``scenes`` and stitches every
+    slide into one video with FFmpeg. Each slide is normalized to a common
+    frame size and rate (still images become fixed-duration segments) before
+    the segments are joined with the concat demuxer (``transition="none"``) or
+    an xfade crossfade chain (``transition="fade"``). Intermediates are
+    written to a temporary directory and cleaned up automatically.
+
+    Args:
+        scenes: Names of the rendered Scene/Slide classes to include, in order.
+        dest: Destination path for the exported video
+            (e.g., "presentation.mp4").
+        folder: Directory containing the rendered slide assets (default "slides").
+        workspace_dir: Working directory. Defaults to the ``WORKSPACE_DIR``
+            environment variable or the current directory.
+        fps: Frame rate of the exported video. Defaults to 30.
+        width: Target frame width in pixels. Defaults to the first scene's
+            rendered resolution.
+        height: Target frame height in pixels. Defaults to the first scene's
+            rendered resolution.
+        transition: Segment transition: "none" (hard cuts) or "fade"
+            (crossfades). Defaults to "none".
+        transition_duration: Duration in seconds of each crossfade when
+            ``transition`` is "fade". Defaults to 0.5.
+        image_duration: Duration in seconds for still-image slides. Defaults
+            to 2.0.
+        timeout: Maximum time in seconds to wait for the export.
+
+    Returns:
+        A JSON string with the export status, destination path, exported
+        scenes, slide count, total duration, executed command, and captured
+        stdout/stderr.
+    """
+    if transition not in EXPORT_TRANSITIONS:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Invalid transition '{transition}'. "
+                    f"Valid transitions: {', '.join(EXPORT_TRANSITIONS)}."
+                ),
+            },
+            indent=2,
+        )
+    if fps < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"fps must be a positive integer, got {fps}.",
+            },
+            indent=2,
+        )
+    if image_duration <= 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"image_duration must be positive, got {image_duration}.",
+            },
+            indent=2,
+        )
+    if transition_duration < 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"transition_duration must be non-negative, "
+                    f"got {transition_duration}."
+                ),
+            },
+            indent=2,
+        )
+    if not scenes:
+        return json.dumps({"success": False, "error": "No scenes provided."}, indent=2)
+
+    cwd = workspace_dir or os.environ.get("WORKSPACE_DIR")
+    folder_path = Path(cwd or ".").joinpath(folder)
+
+    slides: list[dict] = []
+    first_resolution = None
+    for scene in scenes:
+        data = _load_scene_config(folder_path, scene)
+        if data is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Scene '{scene}' not found in {folder_path}.",
+                },
+                indent=2,
+            )
+        if first_resolution is None:
+            first_resolution = data.get("resolution")
+        for slide in data.get("slides", []):
+            slides.append(
+                {
+                    "path": _resolve_slide_media(cwd, slide),
+                    "type": slide.get("type"),
+                    "file": slide.get("file"),
+                }
+            )
+    if not slides:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"No slides found in scenes: {', '.join(scenes)}.",
+            },
+            indent=2,
+        )
+
+    missing = [
+        str(entry["path"] if entry["path"] is not None else entry["file"])
+        for entry in slides
+        if entry["path"] is None or not entry["path"].is_file()
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Slide media files not found: {', '.join(missing)}.",
+            },
+            indent=2,
+        )
+
+    if width is None or height is None:
+        if (
+            isinstance(first_resolution, (list, tuple))
+            and len(first_resolution) == 2
+            and all(isinstance(value, int) and value > 0 for value in first_resolution)
+        ):
+            width = width if width is not None else first_resolution[0]
+            height = height if height is not None else first_resolution[1]
+    if width is None or height is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Could not determine target width/height: pass them "
+                    "explicitly or render scenes with a valid 'resolution' entry."
+                ),
+            },
+            indent=2,
+        )
+    if width < 1 or height < 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"width and height must be positive integers, got {width}x{height}."
+                ),
+            },
+            indent=2,
+        )
+
+    ffmpeg = _ffmpeg_executable()
+    if ffmpeg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "ffmpeg executable not found. Install FFmpeg to export videos."
+                ),
+            },
+            indent=2,
+        )
+
+    destination = Path(cwd or ".").joinpath(dest).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    media = [{"path": str(entry["path"]), "type": entry["type"]} for entry in slides]
+    deadline = time.monotonic() + timeout
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="manim_export_") as tmp:
+            workdir = Path(tmp)
+            segment_paths = [
+                str(workdir / f"segment_{index:03d}.mp4") for index in range(len(media))
+            ]
+            concat_list_path = workdir / "concat.txt"
+            # Normalization is transition-independent; the fade offsets can
+            # only be computed once the segments exist and are measured.
+            commands = _build_export_command(
+                media=media,
+                dest=str(destination),
+                width=width,
+                height=height,
+                segment_paths=segment_paths,
+                fps=fps,
+                transition="none",
+                transition_duration=transition_duration,
+                image_duration=image_duration,
+                concat_list_path=str(concat_list_path),
+            )
+            concat_list_path.write_text(
+                _concat_list_text(segment_paths), encoding="utf-8"
+            )
+            for command in commands:
+                command[0] = ffmpeg
+            for command in commands[:-1]:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+                if result.stdout.strip():
+                    stdout_parts.append(result.stdout.strip())
+                if result.stderr.strip():
+                    stderr_parts.append(result.stderr.strip())
+                if result.returncode != 0:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                result.stderr.strip() or "Unknown video export error."
+                            ),
+                            "stdout": result.stdout.strip(),
+                            "stderr": result.stderr.strip(),
+                        },
+                        indent=2,
+                    )
+
+            durations = [_ffprobe_duration(segment) for segment in segment_paths]
+            if any(duration is None for duration in durations):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "Could not determine slide segment durations with ffprobe."
+                        ),
+                    },
+                    indent=2,
+                )
+            if transition == "fade":
+                commands = _build_export_command(
+                    media=media,
+                    dest=str(destination),
+                    width=width,
+                    height=height,
+                    segment_paths=segment_paths,
+                    fps=fps,
+                    transition=transition,
+                    transition_duration=transition_duration,
+                    image_duration=image_duration,
+                    concat_list_path=str(concat_list_path),
+                    durations=durations,
+                )
+                commands[-1][0] = ffmpeg
+            command = commands[-1]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+            if result.stdout.strip():
+                stdout_parts.append(result.stdout.strip())
+            if result.stderr.strip():
+                stderr_parts.append(result.stderr.strip())
+            if result.returncode != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            result.stderr.strip() or "Unknown video export error."
+                        ),
+                        "stdout": result.stdout.strip(),
+                        "stderr": result.stderr.strip(),
+                    },
+                    indent=2,
+                )
+        segment_durations = [duration for duration in durations if duration is not None]
+        if transition == "fade" and len(segment_durations) > 1:
+            total_duration = (
+                sum(segment_durations)
+                - (len(segment_durations) - 1) * transition_duration
+            )
+        else:
+            total_duration = sum(segment_durations)
+        return json.dumps(
+            {
+                "success": True,
+                "dest": str(destination),
+                "scenes": scenes,
+                "slide_count": len(slides),
+                "transition": transition,
+                "duration": round(total_duration, 3),
+                "command": command,
+                "stdout": "\n".join(stdout_parts),
+                "stderr": "\n".join(stderr_parts),
+            },
+            indent=2,
+        )
+    except subprocess.TimeoutExpired as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Video export timed out after {timeout}s: {e}",
+            },
+            indent=2,
+        )
+    except FileNotFoundError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"ffmpeg executable not found: {e}",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Error executing export_video tool: {e}",
+            },
+            indent=2,
+        )
 
 
 MEDIA_EXTENSIONS = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg"}
@@ -1069,6 +2203,29 @@ def _render_cache_key(code: str, scenes: list[str] | None, quality: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _scene_cache_key(preamble: str, class_source: str, quality: str) -> str:
+    """Return a deterministic content hash for a single scene render.
+
+    The key captures the shared module preamble, the scene's own class source,
+    and the render quality. Editing one scene class therefore never
+    invalidates the cache entries of its siblings, while a change to shared
+    helpers or imports invalidates every scene that uses them.
+
+    Args:
+        preamble: Module source outside any scene class (imports, helpers).
+        class_source: Source of the scene's ``ClassDef`` (with decorators).
+        quality: Render quality used for the scene.
+
+    Returns:
+        A hex-encoded SHA-256 digest identifying the scene's render outputs.
+    """
+    payload = json.dumps(
+        {"module": preamble, "scene": class_source, "quality": quality},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _render_cache_entry(workspace: Path, key: str) -> Path:
     """Return the cache directory for a given render key."""
     return workspace / CACHE_DIR_NAME / key
@@ -1143,6 +2300,187 @@ def _restore_render_cache(
         shutil.copy2(source, destination)
         restored.append(str(destination.resolve()))
     return restored
+
+
+def _scene_output_files(
+    workspace: Path,
+    scene: str,
+    outputs: list[str],
+) -> list[str]:
+    """Return the subset of rendered outputs belonging to a single scene.
+
+    A scene's outputs are its slide config (``slides/<Scene>.json``), the
+    media files that config references, and any rendered file named after the
+    scene (e.g. ``videos/480p15/<Scene>.mp4``). Keeping entries per scene is
+    what allows a cache hit for one scene to be restored independently of its
+    siblings.
+
+    Args:
+        workspace: Directory that contains the rendered media tree.
+        scene: Name of the Scene/Slide class.
+        outputs: Absolute paths of files produced by the render, as returned
+            by ``_find_rendered_outputs``.
+
+    Returns:
+        Sorted absolute paths of the scene's cacheable output files. Paths are
+        kept in ``workspace``-relative prefix form so they can be stored by
+        ``_save_render_cache``.
+    """
+    picked: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        raw = str(path)
+        if raw in seen:
+            return
+        if path.suffix.lower() not in CACHEABLE_EXTENSIONS:
+            return
+        if not path.is_file():
+            return
+        seen.add(raw)
+        picked.append(raw)
+
+    add(workspace / "slides" / f"{scene}.json")
+    data = _load_scene_config(workspace / "slides", scene)
+    for slide in (data or {}).get("slides", []):
+        file = slide.get("file")
+        if file:
+            add(Path(file) if os.path.isabs(file) else workspace / file)
+    for raw in outputs:
+        path = Path(raw)
+        if path.stem == scene:
+            add(path)
+    return sorted(picked)
+
+
+def _plan_scene_cache(
+    workspace: Path,
+    preamble: str,
+    fragments: dict[str, str],
+    requested: list[str],
+    quality: str,
+    use_cache: bool,
+) -> tuple[dict[str, bool], list[str], list[str], dict[str, str]]:
+    """Resolve per-scene cache hits and restore cached outputs.
+
+    For every requested scene a cache key is derived from the module preamble
+    plus that scene's class source. Scenes whose entry is present are restored
+    into the workspace; the rest are the render misses.
+
+    Args:
+        workspace: Directory holding the render cache and media tree.
+        preamble: Module source outside any scene class.
+        fragments: Mapping of scene name to class source from
+            ``_extract_scene_fragments``.
+        requested: Names of the scenes the caller wants rendered.
+        quality: Render quality used to derive cache keys.
+        use_cache: When False every scene is treated as a miss.
+
+    Returns:
+        Tuple of ``(scene_cache, missed, restored_media, scene_keys)``:
+        per-scene hit flags, the scene names that need rendering, restored
+        media paths, and the per-scene cache keys for extractable scenes.
+    """
+    scene_cache: dict[str, bool] = {}
+    missed: list[str] = []
+    restored_media: list[str] = []
+    scene_keys: dict[str, str] = {}
+    for scene in requested:
+        source = fragments.get(scene)
+        key = None
+        if source is not None:
+            key = _scene_cache_key(preamble, source, quality)
+            scene_keys[scene] = key
+        hit = False
+        if use_cache and key is not None:
+            files = _load_render_cache(workspace, key)
+            if files is not None:
+                try:
+                    restored = _restore_render_cache(workspace, key, files)
+                except OSError:
+                    restored = None
+                if restored is not None:
+                    hit = True
+                    restored_media.extend(
+                        path
+                        for path in restored
+                        if Path(path).suffix.lower() in MEDIA_EXTENSIONS
+                    )
+        scene_cache[scene] = hit
+        if not hit:
+            missed.append(scene)
+    return scene_cache, missed, restored_media, scene_keys
+
+
+def _cache_scene_outputs(
+    workspace: Path,
+    scene_keys: dict[str, str],
+    rendered: list[str],
+    outputs: list[str],
+) -> None:
+    """Store one cache entry per rendered scene, keyed by its class source.
+
+    Args:
+        workspace: Directory holding the render cache and media tree.
+        scene_keys: Mapping of scene name to its per-scene cache key.
+        rendered: Names of the scenes produced by the render.
+        outputs: Absolute paths of files produced by the render.
+    """
+    for scene in rendered:
+        key = scene_keys.get(scene)
+        if key is None:
+            continue
+        files = _scene_output_files(workspace, scene, outputs)
+        if not files:
+            continue
+        try:
+            _save_render_cache(workspace, key, files)
+        except (OSError, ValueError):
+            pass
+
+
+SYNC_STATE_NAME = ".sync_state.json"
+
+
+def _load_sync_state(workspace: Path) -> dict[str, dict]:
+    """Return the scene state map recorded by the last successful sync.
+
+    Args:
+        workspace: Directory holding the ``.sync_state.json`` state file.
+
+    Returns:
+        A mapping of scene name to its recorded entry (``{"key": ...}``).
+        Missing or corrupt state files yield an empty mapping.
+    """
+    path = workspace / SYNC_STATE_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    scenes = data.get("scenes")
+    if not isinstance(scenes, dict):
+        return {}
+    return {name: entry for name, entry in scenes.items() if isinstance(entry, dict)}
+
+
+def _save_sync_state(workspace: Path, scenes: dict[str, dict]) -> Path:
+    """Write the scene state map produced by a successful sync.
+
+    Args:
+        workspace: Directory holding the ``.sync_state.json`` state file.
+        scenes: Mapping of scene name to its entry (``{"key": ...}``).
+
+    Returns:
+        The path of the written state file.
+    """
+    path = workspace / SYNC_STATE_NAME
+    path.write_text(
+        json.dumps({"scenes": scenes}, indent=2),
+        encoding="utf-8",
+    )
+    return path
 
 
 @dataclass(frozen=True)
@@ -1344,6 +2682,64 @@ async def _run_render_streaming(
     return output
 
 
+def _run_render_sync(
+    command: list[str],
+    workspace: Path,
+    scenes: list[str] | None,
+    quality: str,
+    start: float,
+    timeout: int,
+    ctx: Context | None = None,
+) -> dict:
+    """Run the streaming render pipeline from synchronous code.
+
+    Delegates to ``_run_render_streaming`` and drives its coroutine on a
+    private event loop, so synchronous tools can reuse the exact render and
+    progress path used by ``execute_manim_code``.
+
+    Args:
+        command: The ``manim-slides render`` argument list.
+        workspace: Working directory for the render.
+        scenes: Scene names passed to the render, or None for all scenes.
+        quality: Render quality label reported in the result.
+        start: Timestamp used to discover freshly rendered outputs.
+        timeout: Maximum render time in seconds.
+        ctx: Optional MCP context for progress notifications.
+
+    Returns:
+        The render result dictionary produced by ``_run_render_streaming``.
+    """
+    outcome = _run_render_streaming(
+        command=command,
+        workspace=workspace,
+        scenes=scenes,
+        quality=quality,
+        start=start,
+        timeout=timeout,
+        ctx=ctx,
+    )
+    if not inspect.isawaitable(outcome):
+        return outcome
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(outcome)
+    result: dict = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(outcome)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 @mcp.tool()
 async def execute_manim_code(
     code: str,
@@ -1361,9 +2757,11 @@ async def execute_manim_code(
     produced media files. Rendered-frame percentages are streamed to the client
     as ``notifications/progress`` updates while rendering is in progress.
 
-    Renders are cached by a content hash of ``code``, ``scenes``, and
-    ``quality``: an unchanged request reuses the previously rendered media
-    instead of re-rendering.
+    Renders are cached per scene by a content hash of the shared module
+    preamble, the scene's class source, and ``quality``: editing one scene
+    never invalidates the cache entries of its siblings, and only scenes whose
+    source changed are passed to the renderer. Code without top-level scene
+    classes falls back to the legacy whole-file cache key.
 
     Args:
         code: Python source code defining one or more Manim Scene/Slide classes.
@@ -1380,92 +2778,843 @@ async def execute_manim_code(
     Returns:
         A JSON string with the render status, produced media file paths,
         executed command, and captured stdout/stderr. A cache hit sets
-        ``cached`` to True and omits the command.
+        ``cached`` to True and omits the command. ``scene_cache`` reports the
+        per-scene hit/miss outcome.
     """
     workspace = _resolve_workspace_dir(media_dir)
 
     syntax_error = _validate_python_syntax(code)
     if syntax_error:
-        return json.dumps({"success": False, "error": syntax_error})
+        return json.dumps({"success": False, "error": syntax_error}, indent=2)
 
     availability_error = _manim_slides_availability_error()
     if availability_error:
-        return json.dumps({"success": False, "error": availability_error})
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
 
-    if use_cache:
-        key = _render_cache_key(code, scenes, quality)
-        cached_files = _load_render_cache(workspace, key)
-        if cached_files is not None:
-            restored = _restore_render_cache(workspace, key, cached_files)
-            media_files = [
-                path
-                for path in restored
-                if Path(path).suffix.lower() in MEDIA_EXTENSIONS
-            ]
+    preamble, fragments = _extract_scene_fragments(code)
+    requested = list(scenes) if scenes else list(fragments)
+    scene_cache: dict[str, bool] = {}
+    restored_media: list[str] = []
+    scene_keys: dict[str, str] = {}
+    render_scenes: list[str] | None
+
+    if requested:
+        scene_cache, missed, restored_media, scene_keys = _plan_scene_cache(
+            workspace=workspace,
+            preamble=preamble,
+            fragments=fragments,
+            requested=requested,
+            quality=quality,
+            use_cache=use_cache,
+        )
+        if use_cache and not missed:
             await _report_render_progress(ctx, 100.0, 100.0, "Render skipped (cached).")
             return json.dumps(
                 {
                     "success": True,
                     "cached": True,
-                    "scenes": scenes or ["(all)"],
+                    "scenes": requested,
                     "quality": quality,
                     "media_dir": str(workspace.resolve()),
-                    "media_files": media_files,
+                    "media_files": restored_media,
+                    "scene_cache": scene_cache,
                     "stdout": "",
                     "stderr": "",
                 },
                 indent=2,
             )
+        render_scenes = missed
+    else:
+        # Legacy whole-module path for code without top-level scene classes.
+        render_scenes = None
+        if use_cache:
+            key = _render_cache_key(code, scenes, quality)
+            cached_files = _load_render_cache(workspace, key)
+            if cached_files is not None:
+                restored = _restore_render_cache(workspace, key, cached_files)
+                media_files = [
+                    path
+                    for path in restored
+                    if Path(path).suffix.lower() in MEDIA_EXTENSIONS
+                ]
+                await _report_render_progress(
+                    ctx, 100.0, 100.0, "Render skipped (cached)."
+                )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "cached": True,
+                        "scenes": scenes or ["(all)"],
+                        "quality": quality,
+                        "media_dir": str(workspace.resolve()),
+                        "media_files": media_files,
+                        "scene_cache": {},
+                        "stdout": "",
+                        "stderr": "",
+                    },
+                    indent=2,
+                )
 
     start = time.time()
     try:
         with _temporary_script(code, workspace) as script:
             command = _build_render_command(
                 script=script,
-                scenes=scenes,
+                scenes=render_scenes,
                 quality=quality,
                 media_dir=workspace,
             )
             result = await _run_render_streaming(
                 command=command,
                 workspace=workspace,
-                scenes=scenes,
+                scenes=render_scenes,
                 quality=quality,
                 start=start,
                 timeout=timeout,
                 ctx=ctx,
             )
         if use_cache and result.get("success"):
-            try:
-                _save_render_cache(
-                    workspace,
-                    _render_cache_key(code, scenes, quality),
-                    _find_rendered_outputs(workspace, start),
+            outputs = _find_rendered_outputs(workspace, start)
+            if requested:
+                _cache_scene_outputs(
+                    workspace, scene_keys, render_scenes or [], outputs
                 )
-            except OSError:
-                pass
+            else:
+                try:
+                    _save_render_cache(
+                        workspace,
+                        _render_cache_key(code, scenes, quality),
+                        outputs,
+                    )
+                except OSError:
+                    pass
+        if requested:
+            result["scenes"] = requested
+            if restored_media:
+                result["media_files"] = sorted(
+                    set(restored_media) | set(result.get("media_files", []))
+                )
+        result["scene_cache"] = scene_cache
         return json.dumps(result, indent=2)
     except subprocess.TimeoutExpired as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Rendering timed out after {timeout}s: {e}",
-            }
+            },
+            indent=2,
         )
     except FileNotFoundError as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"manim-slides executable not found: {e}",
-            }
+            },
+            indent=2,
         )
     except Exception as e:
         return json.dumps(
             {
                 "success": False,
                 "error": f"Error executing execute_manim_code tool: {e}",
-            }
+            },
+            indent=2,
         )
+
+
+@mcp.tool()
+def sync_deck(
+    code: str,
+    scenes: list[str] | None = None,
+    dest: str = "deck.html",
+    folder: str = "slides",
+    quality: str = "l",
+    output_format: str = "auto",
+    config: dict[str, str] | None = None,
+    one_file: bool = False,
+    media_dir: str | None = None,
+    workspace_dir: str | None = None,
+    timeout: int = 600,
+) -> str:
+    """Render changed scenes and recompile the deck in a single call.
+
+    Extracts per-scene fragments from ``code`` and compares each scene's
+    content hash against the per-scene render cache and the state of the last
+    successful sync (``<workspace>/.sync_state.json``). Only new or changed
+    scenes are rendered; unchanged scenes are restored from cache; scenes that
+    disappeared from the code are reported as removed. The deck is then
+    recompiled to ``dest`` with ``manim-slides convert``.
+
+    Args:
+        code: Python source code defining one or more Manim Scene/Slide classes.
+        scenes: Names of the Scene/Slide classes to include, in order. If
+            omitted or empty, all scene classes in the code are included.
+        dest: Destination path for the compiled presentation
+            (e.g., "deck.html").
+        folder: Directory containing the rendered slide assets (default "slides").
+        quality: Render quality: "l" (low), "m" (medium), "h" (high),
+            "p" (2K), or "k" (4K). Defaults to "l".
+        output_format: Conversion format: "auto", "html", "pdf", "pptx", or
+            "zip".
+        config: Extra converter options as key/value pairs
+            (e.g., {"slide_number": "true"}).
+        one_file: Embed all local assets (e.g., videos) into a single output.
+        media_dir: Directory where rendered media is stored. Defaults to
+            ``workspace_dir``, then the ``WORKSPACE_DIR`` environment variable,
+            then a temporary directory.
+        workspace_dir: Working directory used when ``media_dir`` is omitted.
+        timeout: Maximum time in seconds for rendering and conversion.
+
+    Returns:
+        A JSON string with the per-scene outcome (``rendered``, ``reused``,
+        ``removed``, ``scene_cache``), the compiled destination, and the
+        converter output. The sync state is only updated on success.
+    """
+    workspace = _resolve_workspace_dir(media_dir or workspace_dir)
+
+    syntax_error = _validate_python_syntax(code)
+    if syntax_error:
+        return json.dumps({"success": False, "error": syntax_error}, indent=2)
+
+    availability_error = _manim_slides_availability_error()
+    if availability_error:
+        return json.dumps({"success": False, "error": availability_error}, indent=2)
+
+    preamble, fragments = _extract_scene_fragments(code)
+    requested = list(scenes) if scenes else list(fragments)
+    if not requested:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "No scenes to sync: define Scene/Slide classes in the code "
+                    "or pass scenes explicitly."
+                ),
+            },
+            indent=2,
+        )
+
+    previous_state = _load_sync_state(workspace)
+    scene_cache, to_render, restored_media, scene_keys = _plan_scene_cache(
+        workspace=workspace,
+        preamble=preamble,
+        fragments=fragments,
+        requested=requested,
+        quality=quality,
+        use_cache=True,
+    )
+    reused = [scene for scene in requested if scene_cache[scene]]
+    removed = [name for name in previous_state if name not in fragments]
+
+    render_result: dict = {}
+    if to_render:
+        start = time.time()
+        try:
+            with _temporary_script(code, workspace) as script:
+                command = _build_render_command(
+                    script=script,
+                    scenes=to_render,
+                    quality=quality,
+                    media_dir=workspace,
+                )
+                render_result = _run_render_sync(
+                    command=command,
+                    workspace=workspace,
+                    scenes=to_render,
+                    quality=quality,
+                    start=start,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Rendering timed out after {timeout}s: {e}",
+                },
+                indent=2,
+            )
+        except FileNotFoundError as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"manim-slides executable not found: {e}",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Error executing sync_deck tool: {e}",
+                },
+                indent=2,
+            )
+        if not render_result.get("success"):
+            failure = {
+                "success": False,
+                "error": render_result.get("error") or "Unknown render error.",
+            }
+            for field in ("missing_dependency", "hint"):
+                if render_result.get(field):
+                    failure[field] = render_result[field]
+            return json.dumps(failure, indent=2)
+        _cache_scene_outputs(
+            workspace,
+            scene_keys,
+            to_render,
+            _find_rendered_outputs(workspace, start),
+        )
+
+    convert_command = _build_convert_command(
+        scenes=requested,
+        dest=dest,
+        folder=folder,
+        output_format=output_format,
+        config=config,
+        one_file=one_file,
+    )
+    convert_result = json.loads(
+        _run_convert(
+            convert_command,
+            dest,
+            requested,
+            output_format,
+            str(workspace),
+            timeout,
+        )
+    )
+    if not convert_result.get("success"):
+        return json.dumps(
+            {
+                "success": False,
+                "error": convert_result.get("error") or "Unknown conversion error.",
+            },
+            indent=2,
+        )
+
+    new_state = {
+        name: {"key": _scene_cache_key(preamble, source, quality)}
+        for name, source in fragments.items()
+    }
+    try:
+        _save_sync_state(workspace, new_state)
+    except OSError:
+        pass
+
+    return json.dumps(
+        {
+            "success": True,
+            "scenes": requested,
+            "rendered": to_render,
+            "reused": reused,
+            "removed": removed,
+            "dest": convert_result["destination"],
+            "media_files": sorted(
+                set(restored_media) | set(render_result.get("media_files", []))
+            ),
+            "scene_cache": scene_cache,
+            "quality": quality,
+            "format": convert_result.get("format"),
+            "command": convert_result.get("command"),
+            "stdout": convert_result.get("stdout"),
+            "stderr": convert_result.get("stderr"),
+        },
+        indent=2,
+    )
+
+
+_PROMPT_TYPOGRAPHY = """\
+Typography and positioning:
+- Use ``Text`` for prose and ``MathTex`` for math; set ``font_size``
+  explicitly (titles 48-64, body 28-36, captions 20-24).
+- Position mobjects with ``to_edge``/``to_corner``/``align_to`` and keep
+  consistent margins; group related mobjects in a ``VGroup`` and tune
+  spacing with ``arrange``.
+- Emphasize with color sparingly (e.g. ``YELLOW`` for the active item,
+  ``GREY_B`` for supporting text) on a dark background."""
+
+_PROMPT_SLIDE_MECHANICS = """\
+Slide mechanics:
+- Subclass ``Slide`` from ``manim_slides`` (not ``Scene``) and import Manim
+  with ``from manim import *``.
+- Call ``self.next_slide()`` after every beat the presenter pauses on:
+  build one idea per beat, animate it, then advance.
+- Name the scene class descriptively so it can be rendered selectively via
+  this server's ``scenes=["<ClassName>"]`` argument."""
+
+_PROMPT_TOOLCHAIN = """\
+After writing the code, iterate with this MCP server's tools:
+``execute_manim_code`` to render the scene, ``preview_slide``/
+``screenshot_deck`` feedback to fix layout or timing, and finally
+``export_revealjs_html`` or ``compile_presentation`` to deliver the deck."""
+
+
+def _split_csv_items(value: str) -> list[str]:
+    """Split a comma-separated prompt argument into trimmed, non-empty items.
+
+    Args:
+        value: Raw comma-separated string (e.g. "Intro, Demo, Results").
+
+    Returns:
+        The individual items with surrounding whitespace removed.
+    """
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _numbered_items(items: list[str]) -> str:
+    """Render items as a numbered list for inclusion in prompt bodies.
+
+    Args:
+        items: Already-trimmed list items.
+
+    Returns:
+        A newline-joined numbered list, or a placeholder when empty.
+    """
+    if not items:
+        return "(none provided)"
+    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
+
+
+@mcp.prompt(
+    name="title_slide",
+    title="Title Slide",
+    description=(
+        "Generate Manim-Slides Python code for an opening title slide "
+        "with a title, optional subtitle, and optional author."
+    ),
+)
+def title_slide(title: str, subtitle: str = "", author: str = "") -> str:
+    """Create a prompt that writes a Manim-Slides opening title slide.
+
+    Args:
+        title: Main presentation title.
+        subtitle: Optional subtitle shown below the title.
+        author: Optional author or presenter name.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the title slide.
+    """
+    content_lines = [f"- title: {title}"]
+    if subtitle:
+        content_lines.append(f"- subtitle: {subtitle}")
+    if author:
+        content_lines.append(f"- author: {author}")
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class TitleSlide(Slide):",
+        "    def construct(self):",
+        f"        title = Text({title!r}, font_size=64)",
+        "        title.to_edge(UP, buff=1.2)",
+    ]
+    if subtitle:
+        skeleton_lines += [
+            f"        subtitle = Text({subtitle!r}, font_size=36)",
+            "        subtitle.next_to(title, DOWN, buff=0.6)",
+        ]
+    if author:
+        skeleton_lines += [
+            f"        author = Text({author!r}, font_size=28)",
+            "        author.to_edge(DOWN, buff=1.2)",
+        ]
+    skeleton_lines.append("        self.play(Write(title), run_time=1.0)")
+    if subtitle:
+        skeleton_lines.append("        self.play(FadeIn(subtitle), run_time=0.6)")
+    if author:
+        skeleton_lines.append("        self.play(FadeIn(author), run_time=0.6)")
+    skeleton_lines += [
+        "        self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for the opening title slide of a",
+            "presentation.",
+            "",
+            "Slide content:",
+            "\n".join(content_lines),
+            "",
+            "Layout:",
+            "- Give the title a single dominant block near the top-center of",
+            "  the frame; the subtitle and author are supporting lines and",
+            "  must never compete in size with the title.",
+            "- Reveal elements in reading order (title, subtitle, author) and",
+            "  pause with ``self.next_slide()`` only once the slide is fully",
+            "  composed, so the presenter can open the talk before advancing.",
+            "- Leave generous negative space and skip decorative mobjects; the",
+            "  opening slide should be readable in one glance.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="agenda",
+    title="Agenda Slide",
+    description=(
+        "Generate Manim-Slides Python code for an agenda slide listing "
+        "the presentation topics as a numbered list."
+    ),
+)
+def agenda(topics: str) -> str:
+    """Create a prompt that writes a Manim-Slides agenda slide.
+
+    Args:
+        topics: Comma-separated agenda topics in presentation order
+            (e.g. "Intro, Demo, Results").
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the agenda slide.
+    """
+    items = _split_csv_items(topics)
+    if items:
+        item_lines = [f"            Text({item!r}, font_size=32)," for item in items]
+    else:
+        item_lines = ['            Text("<topic>", font_size=32),']
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class Agenda(Slide):",
+        "    def construct(self):",
+        '        heading = Text("Agenda", font_size=56)',
+        "        heading.to_edge(UP, buff=1.0)",
+        "        items = VGroup(",
+        *item_lines,
+        "        )",
+        "        items.arrange(DOWN, aligned_edge=LEFT, buff=0.5)",
+        "        items.next_to(heading, DOWN, buff=0.8)",
+        "        self.play(Write(heading))",
+        "        self.next_slide()",
+        "        for item in items:",
+        "            self.play(FadeIn(item, shift=RIGHT * 0.2), run_time=0.4)",
+        "            self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for an agenda slide that lists",
+            "the topics of the presentation.",
+            "",
+            "Slide content (in presentation order):",
+            _numbered_items(items),
+            "",
+            "Layout:",
+            "- One agenda slide with a fixed heading and a vertical numbered",
+            "  list; keep left edges aligned and line spacing even.",
+            "- Reveal topics one at a time with a short fade/shift per line",
+            "  and call ``self.next_slide()`` after each topic so the",
+            "  presenter can introduce each section before it appears.",
+            "- If the list exceeds about seven items, split it across two",
+            "  agenda slides rather than shrinking the font below 28.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="code_walkthrough",
+    title="Code Walkthrough",
+    description=(
+        "Generate Manim-Slides Python code that narrates a real code "
+        "snippet step-by-step across several slides."
+    ),
+)
+def code_walkthrough(code: str, title: str = "") -> str:
+    """Create a prompt that walks through real code across several slides.
+
+    Args:
+        code: The code to narrate, supplied verbatim as source text.
+        title: Optional heading for the walkthrough.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the walkthrough slides.
+    """
+    content_lines = []
+    if title:
+        content_lines.append(f"- title: {title}")
+    content_lines.append("- code: the snippet supplied verbatim below")
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class CodeWalkthrough(Slide):",
+        "    def construct(self):",
+    ]
+    if title:
+        skeleton_lines += [
+            f"        heading = Text({title!r}, font_size=48)",
+            "        heading.to_edge(UP, buff=0.6)",
+        ]
+    skeleton_lines += [
+        "        code = Code(",
+        "            code=SNIPPET,",
+        '            language="python",',
+        "            font_size=24,",
+        '            background="window",',
+        "        )",
+    ]
+    if title:
+        skeleton_lines.append("        code.next_to(heading, DOWN, buff=0.5)")
+    else:
+        skeleton_lines.append("        code.to_edge(UP, buff=0.8)")
+    skeleton_lines += [
+        "        self.play(FadeIn(code))",
+        "        self.next_slide()",
+        '        caption = Text("Step 1: <what happens first>", font_size=28)',
+        "        caption.to_edge(DOWN, buff=0.8)",
+        "        self.play(Write(caption))",
+        "        self.next_slide()",
+        "        # Repeat per narrative step: update the caption, restyle",
+        "        # the lines in focus, then pause with self.next_slide().",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code that narrates the code below",
+            "step-by-step across several slides.",
+            "",
+            "Slide content:",
+            "\n".join(content_lines),
+            "",
+            "Code to narrate (verbatim):",
+            "```python",
+            code,
+            "```",
+            "",
+            "Layout:",
+            "- Keep the code on screen for the whole walkthrough and give it",
+            "  the majority of the frame; narration goes in a one-line caption",
+            "  along the bottom, never over the code.",
+            "- Split the walkthrough into 3-6 narrative steps and make one",
+            "  slide per step: highlight the lines being discussed (e.g.",
+            "  ``YELLOW`` for active, ``GREY_B`` for the rest) and pause with",
+            "  ``self.next_slide()`` after each step.",
+            "- If the code is long, show only the relevant excerpt per step",
+            "  instead of shrinking the font below 20; never alter the code's",
+            "  characters while displaying it.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="math_derivation",
+    title="Math Derivation",
+    description=(
+        "Generate Manim-Slides Python code that reveals a math derivation "
+        "step-by-step across slides."
+    ),
+)
+def math_derivation(steps: str, title: str = "") -> str:
+    """Create a prompt that reveals a math derivation step by step.
+
+    Args:
+        steps: Comma-separated derivation steps written as LaTeX
+            (e.g. "f(x) = x^2, f'(x) = 2x").
+        title: Optional heading for the derivation.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the derivation slides.
+    """
+    items = _split_csv_items(steps)
+    if items:
+        skeleton_lines = [
+            f"        step{index} = MathTex({step!r}, font_size=44)"
+            for index, step in enumerate(items, 1)
+        ]
+        for index in range(2, len(items) + 1):
+            skeleton_lines.append(
+                f"        step{index}.next_to(step{index - 1}, DOWN, buff=0.6)"
+            )
+    else:
+        skeleton_lines = ['        step1 = MathTex("... = ...", font_size=44)']
+    plays = ["        self.play(Write(step1))", "        self.next_slide()"]
+    for index in range(2, len(items) + 1):
+        plays += [
+            f"        self.play(Write(step{index}))",
+            "        self.next_slide()",
+        ]
+
+    header_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class MathDerivation(Slide):",
+        "    def construct(self):",
+    ]
+    if title:
+        header_lines += [
+            f"        heading = Text({title!r}, font_size=48)",
+            "        heading.to_edge(UP, buff=0.6)",
+        ]
+    skeleton_lines = header_lines + skeleton_lines + plays + ["```"]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code that reveals the derivation",
+            "below step by step.",
+            "",
+            "Slide content (in derivation order):",
+            _numbered_items(items),
+            "",
+            "Layout:",
+            "- Show one derivation step per slide and keep earlier steps on",
+            "  screen so the audience sees the derivation build up.",
+            "- Align consecutive steps on the equals sign (or the dominant",
+            "  operator) so the transformation reads vertically; fade older",
+            "  steps toward ``GREY_B`` as the derivation progresses.",
+            "- Pause with ``self.next_slide()`` after revealing each step;",
+            "  if a step needs a long explanation, add a short ``Text``",
+            "  caption below the math instead of cramming the formula.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
+
+
+@mcp.prompt(
+    name="two_column_comparison",
+    title="Two-Column Comparison",
+    description=(
+        "Generate Manim-Slides Python code for a side-by-side comparison "
+        "slide with two titled columns of points."
+    ),
+)
+def two_column_comparison(
+    left_title: str,
+    right_title: str,
+    left_points: str,
+    right_points: str,
+) -> str:
+    """Create a prompt that writes a two-column comparison slide.
+
+    Args:
+        left_title: Heading for the left column (e.g. "Pros").
+        right_title: Heading for the right column (e.g. "Cons").
+        left_points: Comma-separated points for the left column.
+        right_points: Comma-separated points for the right column.
+
+    Returns:
+        An instruction template the client LLM follows to generate the
+        Manim-Slides Python code for the comparison slide.
+    """
+    left_items = _split_csv_items(left_points)
+    right_items = _split_csv_items(right_points)
+    if left_items:
+        left_lines = [
+            f"            Text({item!r}, font_size=28)," for item in left_items
+        ]
+    else:
+        left_lines = ['            Text("<point>", font_size=28),']
+    if right_items:
+        right_lines = [
+            f"            Text({item!r}, font_size=28)," for item in right_items
+        ]
+    else:
+        right_lines = ['            Text("<point>", font_size=28),']
+
+    skeleton_lines = [
+        "```python",
+        "from manim import *",
+        "from manim_slides import Slide",
+        "",
+        "",
+        "class TwoColumnComparison(Slide):",
+        "    def construct(self):",
+        f"        left_header = Text({left_title!r}, font_size=40, color=GREEN)",
+        f"        right_header = Text({right_title!r}, font_size=40, color=RED)",
+        "        left_header.to_edge(UL, buff=1.0)",
+        "        right_header.to_edge(UR, buff=1.0)",
+        "        left_items = VGroup(",
+        *left_lines,
+        "        )",
+        "        left_items.arrange(DOWN, aligned_edge=LEFT, buff=0.45)",
+        "        left_items.next_to(left_header, DOWN, buff=0.7)",
+        "        right_items = VGroup(",
+        *right_lines,
+        "        )",
+        "        right_items.arrange(DOWN, aligned_edge=LEFT, buff=0.45)",
+        "        right_items.next_to(right_header, DOWN, buff=0.7)",
+        "        self.play(Write(left_header), Write(right_header))",
+        "        self.next_slide()",
+        "        for left, right in zip(left_items, right_items):",
+        "            self.play(FadeIn(left), FadeIn(right), run_time=0.4)",
+        "            self.next_slide()",
+        "```",
+    ]
+
+    return "\n".join(
+        [
+            "Write Manim-Slides Python code for a side-by-side comparison",
+            "slide with two titled columns.",
+            "",
+            "Slide content:",
+            f"Left column - {left_title}:",
+            _numbered_items(left_items),
+            f"Right column - {right_title}:",
+            _numbered_items(right_items),
+            "",
+            "Layout:",
+            "- Mirror the two columns: same widths, same font sizes, same",
+            "  vertical rhythm, with a distinct but balanced color per side",
+            "  so the audience can compare line by line.",
+            "- Keep points short (one line each); align matching points on the",
+            "  same row and top-align both columns even when the point counts",
+            "  differ.",
+            "- Reveal the two headers first, pause with ``self.next_slide()``,",
+            "  then reveal paired points row by row, pausing after each pair.",
+            "",
+            _PROMPT_TYPOGRAPHY,
+            _PROMPT_SLIDE_MECHANICS,
+            "Suggested skeleton:",
+            "\n".join(skeleton_lines),
+            "",
+            _PROMPT_TOOLCHAIN,
+        ]
+    )
 
 
 def main() -> None:
