@@ -48,15 +48,22 @@ manim.cfg
 
 # Manim Slides specific
 slides/
+!demo/public/slides/
+!demo/public/slides/deck.mp4
 preview/
 *.html
 *.mp4
+!demo/public/slides/deck.mp4
 
 # IDEs
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# Remotion demo
+demo/node_modules/
+demo/out/
 
 # OS generated files
 .DS_Store
