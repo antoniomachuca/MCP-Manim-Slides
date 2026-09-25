@@ -22,6 +22,7 @@ from mcp_manim_slides.server import (
     _build_revealjs_export_command,
     _concat_list_text,
     _extract_missing_module,
+    _extract_scene_fragments,
     _ffprobe_duration,
     _format_progress_message,
     _load_render_cache,
@@ -31,6 +32,7 @@ from mcp_manim_slides.server import (
     _restore_render_cache,
     _run_render_streaming,
     _save_render_cache,
+    _scene_cache_key,
     _temporary_script,
     _validate_python_syntax,
     _validate_reveal_options,
@@ -47,6 +49,7 @@ from mcp_manim_slides.server import (
     server_status,
     slides_list,
     stop_preview_server,
+    sync_deck,
 )
 
 
@@ -692,6 +695,7 @@ async def test_execute_manim_code_cache_hit_skips_render(monkeypatch, tmp_path):
     )
     assert first["success"] is True
     assert "cached" not in first
+    assert first["scene_cache"] == {"MySlide": False}
     assert len(calls) == 1
 
     second = json.loads(
@@ -699,6 +703,7 @@ async def test_execute_manim_code_cache_hit_skips_render(monkeypatch, tmp_path):
     )
     assert second["success"] is True
     assert second["cached"] is True
+    assert second["scene_cache"] == {"MySlide": True}
     assert any(f.endswith("MySlide.mp4") for f in second["media_files"])
     assert len(calls) == 1
 
@@ -733,7 +738,333 @@ async def test_execute_manim_code_disable_cache(monkeypatch, tmp_path):
     assert second["success"] is True
     assert "cached" not in first
     assert "cached" not in second
+    assert first["scene_cache"] == {"MySlide": False}
+    assert second["scene_cache"] == {"MySlide": False}
     assert len(calls) == 2
+
+
+FRAGMENT_CODE = (
+    "from manim_slides import Slide\n"
+    "\n"
+    "def helper():\n"
+    "    return 1\n"
+    "\n"
+    "class A(Slide):\n"
+    "    def construct(self):\n"
+    "        pass\n"
+    "\n"
+    "class B(Slide):\n"
+    "    def construct(self):\n"
+    "        pass\n"
+)
+
+
+def test_extract_scene_fragments_captures_preamble_and_classes():
+    """Verify class sources are exact and shared helpers land in the preamble."""
+    preamble, fragments = _extract_scene_fragments(FRAGMENT_CODE)
+    assert fragments == {
+        "A": "class A(Slide):\n    def construct(self):\n        pass",
+        "B": "class B(Slide):\n    def construct(self):\n        pass",
+    }
+    assert preamble == "from manim_slides import Slide\ndef helper():\n    return 1"
+    assert "def helper" in preamble
+    assert "from manim_slides import Slide" in preamble
+    assert "class A" not in preamble
+    assert "class B" not in preamble
+    assert "class A" not in fragments["B"]
+
+
+def test_extract_scene_fragments_includes_decorators():
+    """Verify decorator lines are part of the owning scene's source."""
+    preamble, fragments = _extract_scene_fragments("@echo\nclass A(Slide):\n    pass\n")
+    assert preamble == ""
+    assert fragments == {"A": "@echo\nclass A(Slide):\n    pass"}
+
+
+def test_extract_scene_fragments_invalid_code():
+    """Verify invalid code degrades to an empty result instead of raising."""
+    assert _extract_scene_fragments("def broken(:\n") == ("", {})
+
+
+def test_scene_cache_key_stability_and_sensitivity():
+    """Verify editing one scene only changes that scene's cache key."""
+    code_one = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        x = 1\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        x = 2\n"
+    )
+    code_two = code_one.replace("        x = 1\n", "        x = 99\n")
+    preamble_one, fragments_one = _extract_scene_fragments(code_one)
+    preamble_two, fragments_two = _extract_scene_fragments(code_two)
+    assert preamble_one == preamble_two
+
+    key_a_one = _scene_cache_key(preamble_one, fragments_one["A"], "l")
+    key_a_two = _scene_cache_key(preamble_two, fragments_two["A"], "l")
+    key_b_one = _scene_cache_key(preamble_one, fragments_one["B"], "l")
+    key_b_two = _scene_cache_key(preamble_two, fragments_two["B"], "l")
+
+    assert key_a_one != key_a_two
+    assert key_b_one == key_b_two
+    assert key_b_one == _scene_cache_key(preamble_one, fragments_one["B"], "l")
+    assert key_b_one != _scene_cache_key(preamble_one, fragments_one["B"], "h")
+
+
+def test_scene_cache_key_shared_helper_change_invalidates_all():
+    """Verify a preamble change flips every scene's key."""
+    code_one = "def helper():\n    return 1\nclass A(Slide):\n    pass\n"
+    code_two = "def helper():\n    return 2\nclass A(Slide):\n    pass\n"
+    preamble_one, fragments_one = _extract_scene_fragments(code_one)
+    preamble_two, fragments_two = _extract_scene_fragments(code_two)
+    assert preamble_one != preamble_two
+    assert _scene_cache_key(preamble_one, fragments_one["A"], "l") != _scene_cache_key(
+        preamble_two, fragments_two["A"], "l"
+    )
+
+
+@pytest.mark.anyio
+async def test_execute_manim_code_partial_cache_hit_renders_only_missed(
+    monkeypatch, tmp_path
+):
+    """Verify cached scenes are restored and only misses reach the renderer."""
+    code = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+    )
+    preamble, fragments = _extract_scene_fragments(code)
+    key_a = _scene_cache_key(preamble, fragments["A"], "l")
+    key_b = _scene_cache_key(preamble, fragments["B"], "l")
+    seeded_video = tmp_path / "videos" / "480p15" / "A.mp4"
+    seeded_video.parent.mkdir(parents=True, exist_ok=True)
+    seeded_video.write_text("cached-a")
+    seeded_config = tmp_path / "slides" / "A.json"
+    seeded_config.parent.mkdir(parents=True, exist_ok=True)
+    seeded_config.write_text("{}")
+    _save_render_cache(tmp_path, key_a, [str(seeded_video), str(seeded_config)])
+
+    render_calls: list[list[str]] = []
+
+    async def fake_render(
+        command, workspace, scenes, quality, start, timeout, ctx=None
+    ):
+        render_calls.append(list(scenes))
+        media_files = []
+        for scene in scenes:
+            video = workspace / "videos" / "480p15" / f"{scene}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_text("fake")
+            media_files.append(str(video))
+            config = workspace / "slides" / f"{scene}.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("{}")
+        return {
+            "success": True,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": media_files,
+            "command": command,
+            "stdout": "Rendered",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._run_render_streaming", fake_render
+    )
+    result = json.loads(
+        await execute_manim_code(
+            code=code, scenes=["A", "B"], media_dir=str(tmp_path)
+        )
+    )
+    assert result["success"] is True
+    assert render_calls == [["B"]]
+    assert result["scene_cache"] == {"A": True, "B": False}
+    assert result["scenes"] == ["A", "B"]
+    assert any(f.endswith("A.mp4") for f in result["media_files"])
+    assert any(f.endswith("B.mp4") for f in result["media_files"])
+    assert _load_render_cache(tmp_path, key_b) is not None
+
+
+def _fake_render_streaming(calls: list[list[str]]):
+    """Return an async ``_run_render_streaming`` stand-in that records scenes."""
+
+    async def fake(command, workspace, scenes, quality, start, timeout, ctx=None):
+        calls.append(list(scenes))
+        media_files = []
+        for scene in scenes:
+            video = workspace / "videos" / "480p15" / f"{scene}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_text("fake")
+            media_files.append(str(video))
+            config = workspace / "slides" / f"{scene}.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("{}")
+        return {
+            "success": True,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": media_files,
+            "command": command,
+            "stdout": "Rendered",
+            "stderr": "",
+        }
+
+    return fake
+
+
+def _fake_convert(calls: list[dict]):
+    """Return a ``_run_convert`` stand-in that records convert invocations."""
+
+    def fake(command, dest, scenes, output_format, cwd, timeout):
+        calls.append({"dest": dest, "scenes": list(scenes)})
+        destination = Path(cwd).joinpath(dest).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("<html>deck</html>")
+        return json.dumps(
+            {
+                "success": True,
+                "format": output_format,
+                "destination": str(destination),
+                "scenes": scenes,
+                "command": command,
+                "stdout": "",
+                "stderr": "",
+            }
+        )
+
+    return fake
+
+
+def test_sync_deck_renders_reuses_and_removes(monkeypatch, tmp_path):
+    """Verify sync renders once, reuses cached scenes, and reports removals."""
+    render_calls: list[list[str]] = []
+    convert_calls: list[dict] = []
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._run_render_streaming",
+        _fake_render_streaming(render_calls),
+    )
+    monkeypatch.setattr(
+        "mcp_manim_slides.server._run_convert", _fake_convert(convert_calls)
+    )
+
+    code_both = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+        "class B(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+    )
+
+    first = json.loads(
+        sync_deck(code=code_both, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert first["success"] is True
+    assert first["rendered"] == ["A", "B"]
+    assert first["reused"] == []
+    assert first["removed"] == []
+    assert first["scene_cache"] == {"A": False, "B": False}
+    assert render_calls == [["A", "B"]]
+    assert first["dest"].endswith("deck.html")
+    state_path = tmp_path / ".sync_state.json"
+    state = json.loads(state_path.read_text())
+    assert set(state["scenes"]) == {"A", "B"}
+
+    second = json.loads(
+        sync_deck(code=code_both, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert second["success"] is True
+    assert second["rendered"] == []
+    assert second["reused"] == ["A", "B"]
+    assert second["scene_cache"] == {"A": True, "B": True}
+    assert render_calls == [["A", "B"]]
+
+    code_edited = code_both.replace(
+        "class B(Slide):\n    def construct(self):\n        pass",
+        "class B(Slide):\n    def construct(self):\n        step = 1",
+    )
+    third = json.loads(
+        sync_deck(code=code_edited, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert third["success"] is True
+    assert third["rendered"] == ["B"]
+    assert third["reused"] == ["A"]
+    assert third["scene_cache"] == {"A": True, "B": False}
+    assert render_calls == [["A", "B"], ["B"]]
+
+    code_only_a = (
+        "class A(Slide):\n"
+        "    def construct(self):\n"
+        "        pass\n"
+    )
+    fourth = json.loads(
+        sync_deck(code=code_only_a, media_dir=str(tmp_path), dest="deck.html")
+    )
+    assert fourth["success"] is True
+    assert fourth["removed"] == ["B"]
+    assert fourth["rendered"] == []
+    assert fourth["reused"] == ["A"]
+    assert render_calls == [["A", "B"], ["B"]]
+    state = json.loads(state_path.read_text())
+    assert set(state["scenes"]) == {"A"}
+    assert convert_calls[-1]["scenes"] == ["A"]
+
+
+def test_sync_deck_syntax_error_envelope(tmp_path):
+    """Verify invalid code fails fast without touching the sync state."""
+    result = json.loads(sync_deck(code="def broken(:\n", media_dir=str(tmp_path)))
+    assert result["success"] is False
+    assert "SyntaxError" in result["error"]
+    assert not (tmp_path / ".sync_state.json").exists()
+
+
+def test_sync_deck_render_failure_returns_error_envelope(monkeypatch, tmp_path):
+    """Verify render failures keep the error envelope and skip state writes."""
+
+    async def fake_fail(command, workspace, scenes, quality, start, timeout, ctx=None):
+        return {
+            "success": False,
+            "scenes": scenes,
+            "quality": quality,
+            "media_dir": str(workspace.resolve()),
+            "media_files": [],
+            "command": command,
+            "stdout": "",
+            "stderr": "ModuleNotFoundError: No module named 'numpy'",
+            "error": "ModuleNotFoundError: No module named 'numpy'",
+            "missing_dependency": "numpy",
+            "hint": "The Python module 'numpy' is not installed. "
+            "Install it with 'pip install numpy'.",
+        }
+
+    monkeypatch.setattr("mcp_manim_slides.server._run_render_streaming", fake_fail)
+    result = json.loads(
+        sync_deck(
+            code="class A(Slide):\n    def construct(self):\n        pass\n",
+            media_dir=str(tmp_path),
+        )
+    )
+    assert result["success"] is False
+    assert "ModuleNotFoundError" in result["error"]
+    assert result["missing_dependency"] == "numpy"
+    assert "pip install numpy" in result["hint"]
+    assert not (tmp_path / ".sync_state.json").exists()
+
+
+def test_sync_deck_no_scenes_reports_error(tmp_path):
+    """Verify code without scene classes is rejected before any subprocess."""
+    result = json.loads(
+        sync_deck(code="def helper():\n    return 1\n", media_dir=str(tmp_path))
+    )
+    assert result["success"] is False
+    assert "No scenes to sync" in result["error"]
 
 
 def test_parse_render_progress_full_bar():
@@ -797,6 +1128,20 @@ async def test_server_list_tools_includes_execute_manim_code():
     assert "manim-slides render" in exec_tool.description
     assert "code" in exec_tool.input_schema["properties"]
     assert "scenes" in exec_tool.input_schema["properties"]
+
+
+@pytest.mark.anyio
+async def test_server_list_tools_includes_sync_deck():
+    """Verify sync_deck tool is registered on the MCPServer."""
+    tools = await mcp.list_tools()
+    tool_names = [t.name for t in tools]
+    assert "sync_deck" in tool_names
+
+    sync_tool = next(t for t in tools if t.name == "sync_deck")
+    assert "code" in sync_tool.input_schema["properties"]
+    assert "dest" in sync_tool.input_schema["properties"]
+    assert "quality" in sync_tool.input_schema["properties"]
+    assert "ctx" not in sync_tool.input_schema["properties"]
 
 
 def _write_scene_config(tmp_path: Path, scene: str, slides: list[dict]) -> Path:

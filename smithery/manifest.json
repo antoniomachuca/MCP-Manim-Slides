@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
   "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Export a single MP4 by concatenating slide media with optional crossfade transitions\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- Five slide-archetype prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison) that guide the client LLM in writing Manim-Slides code",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- `sync_deck` one-call deck sync: per-scene render caching re-renders only changed scenes, then recompiles the deck",
   "author": {
     "name": "Antonio Machuca",
     "url": "https://github.com/antoniomachuca"
@@ -102,6 +103,27 @@
         "required": [
           "code"
         ]
+      }
+    },
+    {
+      "name": "sync_deck",
+      "description": "Render only changed scenes (per-scene caching) and recompile the deck in one call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "description": "Python source code defining one or more Manim Scene/Slide classes." },
+          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the Scene/Slide classes to include in the deck." },
+          "dest": { "type": "string", "default": "deck.html", "description": "Destination path for the compiled presentation." },
+          "folder": { "type": "string", "default": "slides" },
+          "quality": { "type": "string", "enum": ["l", "m", "h", "p", "k"], "default": "l", "description": "Render quality." },
+          "output_format": { "type": "string", "enum": ["auto", "html", "pdf", "pptx", "zip"], "default": "auto" },
+          "config": { "type": "object", "additionalProperties": { "type": "string" } },
+          "one_file": { "type": "boolean", "default": false },
+          "media_dir": { "type": "string", "description": "Directory where rendered media is stored." },
+          "workspace_dir": { "type": "string" },
+          "timeout": { "type": "integer", "default": 600, "description": "Maximum render/convert time in seconds." }
+        },
+        "required": ["code"]
       }
     },
     {
