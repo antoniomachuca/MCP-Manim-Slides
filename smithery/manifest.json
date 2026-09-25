@@ -4,8 +4,7 @@
   "display_name": "Manim-Slides MCP Server",
   "version": "0.1.0",
   "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
-  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Export a single MP4 by concatenating slide media with optional crossfade transitions\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- Five slide-archetype prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison) that guide the client LLM in writing Manim-Slides code",
-  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- `sync_deck` one-call deck sync: per-scene render caching re-renders only changed scenes, then recompiles the deck",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim code headlessly via `manim-slides render`\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Preview individual slides as images, videos, or GIFs\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Render caching and live render-progress reporting\n- `sync_deck` one-call deck sync: per-scene render caching re-renders only changed scenes, then recompiles the deck\n- Screenshot every deck slide headlessly so the AI can see its own deck (optional Playwright `vision` extra)\n- Compose FFmpeg-only contact sheet grids of slide frames with no extra dependencies",
   "author": {
     "name": "Antonio Machuca",
     "url": "https://github.com/antoniomachuca"
@@ -111,19 +110,75 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "code": { "type": "string", "description": "Python source code defining one or more Manim Scene/Slide classes." },
-          "scenes": { "type": "array", "items": { "type": "string" }, "description": "Names of the Scene/Slide classes to include in the deck." },
-          "dest": { "type": "string", "default": "deck.html", "description": "Destination path for the compiled presentation." },
-          "folder": { "type": "string", "default": "slides" },
-          "quality": { "type": "string", "enum": ["l", "m", "h", "p", "k"], "default": "l", "description": "Render quality." },
-          "output_format": { "type": "string", "enum": ["auto", "html", "pdf", "pptx", "zip"], "default": "auto" },
-          "config": { "type": "object", "additionalProperties": { "type": "string" } },
-          "one_file": { "type": "boolean", "default": false },
-          "media_dir": { "type": "string", "description": "Directory where rendered media is stored." },
-          "workspace_dir": { "type": "string" },
-          "timeout": { "type": "integer", "default": 600, "description": "Maximum render/convert time in seconds." }
+          "code": {
+            "type": "string",
+            "description": "Python source code defining one or more Manim Scene/Slide classes."
+          },
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the Scene/Slide classes to include in the deck."
+          },
+          "dest": {
+            "type": "string",
+            "default": "deck.html",
+            "description": "Destination path for the compiled presentation."
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "l",
+              "m",
+              "h",
+              "p",
+              "k"
+            ],
+            "default": "l",
+            "description": "Render quality."
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "html",
+              "pdf",
+              "pptx",
+              "zip"
+            ],
+            "default": "auto"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "one_file": {
+            "type": "boolean",
+            "default": false
+          },
+          "media_dir": {
+            "type": "string",
+            "description": "Directory where rendered media is stored."
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 600,
+            "description": "Maximum render/convert time in seconds."
+          }
         },
-        "required": ["code"]
+        "required": [
+          "code"
+        ]
       }
     },
     {
@@ -432,6 +487,102 @@
         "required": [
           "scenes"
         ]
+      }
+    },
+    {
+      "name": "screenshot_deck",
+      "description": "Capture screenshots of an exported Reveal.js deck's slides with a headless browser (optional Playwright vision extra).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dest": {
+            "type": "string",
+            "description": "Path to the exported HTML deck."
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "slides": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "Zero-based slide indices to capture. When omitted, every slide is captured."
+          },
+          "output_dir": {
+            "type": "string",
+            "default": "screenshots",
+            "description": "Directory for the screenshot files, resolved under the workspace."
+          },
+          "width": {
+            "type": "integer",
+            "default": 1920,
+            "description": "Viewport width in pixels."
+          },
+          "height": {
+            "type": "integer",
+            "default": 1080,
+            "description": "Viewport height in pixels."
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "png",
+              "jpg",
+              "webp"
+            ],
+            "default": "png"
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 120
+          }
+        },
+        "required": [
+          "dest"
+        ]
+      }
+    },
+    {
+      "name": "contact_sheet",
+      "description": "Compose a grid contact sheet of slide frames with FFmpeg only, no extra dependencies.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scenes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the rendered scenes to include, in order. When omitted, every scene is included."
+          },
+          "dest": {
+            "type": "string",
+            "default": "contact_sheet.png",
+            "description": "Destination path for the contact sheet image."
+          },
+          "folder": {
+            "type": "string",
+            "default": "slides"
+          },
+          "workspace_dir": {
+            "type": "string"
+          },
+          "columns": {
+            "type": "integer",
+            "default": 3,
+            "description": "Number of tiles per grid row."
+          },
+          "tile_width": {
+            "type": "integer",
+            "default": 640,
+            "description": "Width in pixels of each tile."
+          },
+          "timeout": {
+            "type": "integer",
+            "default": 300
+          }
+        }
       }
     }
   ],
