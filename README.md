@@ -35,7 +35,6 @@ While traditional AI coding assistants can write Manim code, executing that code
 - **HTML/Reveal.js Export**: Seamlessly compiles the generated video assets into a fully functional interactive web presentation.
 - **Single-MP4 Export**: `export_video` stitches all slide media into one MP4 via FFmpeg, with optional crossfade transitions and fixed-duration handling for still-image slides.
 - **Deck Screenshots & Contact Sheets**: `screenshot_deck` captures every slide headlessly (optional Playwright `vision` extra) so the AI can see its own deck, and `contact_sheet` montages slide frames into a single grid image using FFmpeg only.
-- **In-Browser Deck Editor**: `serve_deck_editor` injects a visual editor into the served deck (drag/resize overlays, z-order, slide hide/reorder, live theme switching) and saves to `deck_layout.json`; `apply_deck_layout` bakes the saved layout into the exported HTML.
 - **One-Click Browser Preview**: Serves the exported Reveal.js HTML on an ephemeral local HTTP server so it can be opened in a browser with a single call.
 - **State Management**: Persists generated media in structured workspace directories for easy access.
 
@@ -64,7 +63,7 @@ uv sync --extra dev --extra vision
 playwright install chromium
 ```
 
-The `vision` extra (or `pip install "mcp-manim-slides[vision]"` for pip users) adds [Playwright](https://playwright.dev/python/), which `screenshot_deck` needs to capture deck slides headlessly; run `playwright install chromium` once afterwards to download the browser binary. Every other tool — rendering, caching, syncing, compiling, exporting video, contact sheets, and the deck editor — works without it.
+The `vision` extra (or `pip install "mcp-manim-slides[vision]"` for pip users) adds [Playwright](https://playwright.dev/python/), which `screenshot_deck` needs to capture deck slides headlessly; run `playwright install chromium` once afterwards to download the browser binary. Every other tool — rendering, caching, syncing, compiling, exporting video, and contact sheets — works without it.
 
 ## Configuration
 
@@ -100,8 +99,6 @@ To integrate this server with an MCP-compatible client (e.g., Claude Desktop, Cu
 - `contact_sheet(scenes: list[str] | None = None, dest: str = "contact_sheet.png", folder: str = "slides", workspace_dir: str | None = None, columns: int = 3, tile_width: int = 640, timeout: int = 300)`: Composes a grid contact sheet of slide frames using FFmpeg only — one representative frame per slide, montaged into a single image (black filler tiles complete the last row) — so an entire deck can be reviewed at a glance without a browser.
 - `list_scenes(folder: str = "slides", workspace_dir: str | None = None)`: Discovers and lists all rendered scenes, slide counts, and metadata available in the workspace.
 - `serve_revealjs_html(dest: str, workspace_dir: str | None = None, host: str = "127.0.0.1", port: int | None = None, open_browser: bool = True)`: Serves an exported Reveal.js HTML deck on an ephemeral local HTTP server for one-click browser preview. Returns the preview URL and optionally opens it in the default browser.
-- `serve_deck_editor(dest: str, workspace_dir: str | None = None, host: str = "127.0.0.1", port: int | None = None, open_browser: bool = True)`: Serves an exported Reveal.js deck with an in-browser visual deck editor injected: drag/resize text and image overlays, z-order up/down, slide hide/unhide and drag-to-reorder, live Reveal theme switching, and a save button that persists the layout to `deck_layout.json` (via `POST /__layout`).
-- `apply_deck_layout(dest: str, layout_path: str = "deck_layout.json", workspace_dir: str | None = None, out: str | None = None)`: Bakes a saved deck layout into an exported Reveal.js HTML deck — reorders slides, drops hidden sections, injects absolutely-positioned overlay markup, and updates the theme stylesheet link — so the edited deck ships as plain HTML.
 - `stop_preview_server(port: int | None = None)`: Stops a running ephemeral preview server by port, or all preview servers when no port is given.
 
 ### Resources (`@mcp.resource`)

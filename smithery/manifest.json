@@ -4,7 +4,7 @@
   "display_name": "Manim-Slides MCP Server",
   "version": "0.1.0",
   "description": "Generate, render, and compile interactive Manim-Slides presentations from AI prompts.",
-  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim-Slides code headlessly via `manim-slides render` with live render-progress reporting and clear error feedback\n- Slide-archetype MCP prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison)\n- Per-scene render caching: only changed scenes are re-rendered, unchanged siblings are restored from cache\n- `sync_deck` incremental sync: render new/changed scenes, restore the rest from cache, and recompile the deck in one call\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Export the whole deck as a single MP4 with FFmpeg, with optional crossfade transitions\n- Preview individual slides as images, videos, or GIFs\n- Screenshot every deck slide headlessly so the AI can see its own deck (optional Playwright `vision` extra)\n- Compose FFmpeg-only contact sheet grids of slide frames with no extra dependencies\n- Serve the exported deck on a local HTTP server for one-click browser preview\n- Edit decks visually in the browser: drag/resize overlays, z-order, slide hide/reorder, and live theme switching\n- Bake the saved deck layout (slide order, hidden slides, overlays) into the exported HTML",
+  "long_description": "A Model Context Protocol (MCP) server that lets AI agents generate, orchestrate, and compile interactive presentations with manim-slides.\n\nFeatures:\n- Execute Manim-Slides code headlessly via `manim-slides render` with live render-progress reporting and clear error feedback\n- Slide-archetype MCP prompt templates (title slide, agenda, code walkthrough, math derivation, two-column comparison)\n- Per-scene render caching: only changed scenes are re-rendered, unchanged siblings are restored from cache\n- `sync_deck` incremental sync: render new/changed scenes, restore the rest from cache, and recompile the deck in one call\n- Compile rendered scenes into interactive HTML (Reveal.js), PDF, or PPTX presentations\n- Export first-class Reveal.js HTML with themes, transitions, and offline/one-file embedding\n- Export the whole deck as a single MP4 with FFmpeg, with optional crossfade transitions\n- Preview individual slides as images, videos, or GIFs\n- Screenshot every deck slide headlessly so the AI can see its own deck (optional Playwright `vision` extra)\n- Compose FFmpeg-only contact sheet grids of slide frames with no extra dependencies\n- Serve the exported deck on a local HTTP server for one-click browser preview",
   "author": {
     "name": "Antonio Machuca",
     "url": "https://github.com/antoniomachuca"
@@ -583,64 +583,6 @@
             "default": 300
           }
         }
-      }
-    },
-    {
-      "name": "serve_deck_editor",
-      "description": "Serve an exported Reveal.js deck with an in-browser visual editor: drag/resize text and image overlays, z-order up/down, slide hide/reorder, and live theme switching, persisting to deck_layout.json.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "dest": {
-            "type": "string",
-            "description": "Path to the exported HTML deck."
-          },
-          "workspace_dir": {
-            "type": "string"
-          },
-          "host": {
-            "type": "string",
-            "default": "127.0.0.1"
-          },
-          "port": {
-            "type": "integer"
-          },
-          "open_browser": {
-            "type": "boolean",
-            "default": true
-          }
-        },
-        "required": [
-          "dest"
-        ]
-      }
-    },
-    {
-      "name": "apply_deck_layout",
-      "description": "Bake a saved deck layout into the exported HTML: reorder slides per layout order, drop hidden slides, and inject absolutely-positioned text/image overlays.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "dest": {
-            "type": "string",
-            "description": "Path to the exported HTML deck."
-          },
-          "layout_path": {
-            "type": "string",
-            "default": "deck_layout.json",
-            "description": "Layout JSON written by the deck editor."
-          },
-          "workspace_dir": {
-            "type": "string"
-          },
-          "out": {
-            "type": "string",
-            "description": "Output path; when omitted, dest is overwritten in place."
-          }
-        },
-        "required": [
-          "dest"
-        ]
       }
     }
   ],

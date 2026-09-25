@@ -5,7 +5,6 @@ import json
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -40,7 +39,6 @@ from mcp_manim_slides.server import (
     _temporary_script,
     _validate_python_syntax,
     _validate_reveal_options,
-    apply_deck_layout,
     compile_presentation,
     contact_sheet,
     execute_manim_code,
@@ -52,7 +50,6 @@ from mcp_manim_slides.server import (
     preview_slide,
     revealjs_config_options,
     screenshot_deck,
-    serve_deck_editor,
     serve_revealjs_html,
     server_status,
     slides_list,
@@ -1987,44 +1984,10 @@ def test_screenshot_deck_missing_dest(tmp_path):
     assert "not found" in result["error"]
 
 
-@pytest.mark.anyio
-async def test_server_list_tools_includes_deck_editor_tools():
-    """Verify serve_deck_editor and apply_deck_layout are registered."""
-    tools = await mcp.list_tools()
-    tool_names = [t.name for t in tools]
-    assert "serve_deck_editor" in tool_names
-    assert "apply_deck_layout" in tool_names
-
-    editor_tool = next(t for t in tools if t.name == "serve_deck_editor")
-    assert "dest" in editor_tool.input_schema["properties"]
-    assert "open_browser" in editor_tool.input_schema["properties"]
-
-    apply_tool = next(t for t in tools if t.name == "apply_deck_layout")
-    assert "layout_path" in apply_tool.input_schema["properties"]
-    assert "out" in apply_tool.input_schema["properties"]
-
-
-def test_serve_deck_editor_missing_file(tmp_path):
-    """Verify serve_deck_editor reports an error for a missing deck."""
-    result = json.loads(
-        serve_deck_editor(dest="nope.html", workspace_dir=str(tmp_path))
-    )
-    assert result["success"] is False
-    assert "not found" in result["error"]
-
-
 def test_screenshot_deck_rejects_non_html(tmp_path):
     """Verify screenshot_deck rejects a non-HTML file."""
     (tmp_path / "deck.pdf").write_text("not html")
     result = json.loads(screenshot_deck(dest="deck.pdf", workspace_dir=str(tmp_path)))
-    assert result["success"] is False
-    assert ".html" in result["error"]
-
-
-def test_serve_deck_editor_rejects_non_html(tmp_path):
-    """Verify serve_deck_editor rejects a non-HTML file."""
-    (tmp_path / "deck.pdf").write_text("not html")
-    result = json.loads(serve_deck_editor(dest="deck.pdf", workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert ".html" in result["error"]
 
@@ -2229,252 +2192,6 @@ def test_contact_sheet_missing_scene(tmp_path):
     assert "not found" in result["error"]
 
 
-def test_serve_deck_editor_success_injects_editor(tmp_path):
-    """Verify the served deck carries the editor and the JS asset is served."""
-    (tmp_path / "deck.html").write_text("<html><body>deck</body></html>")
-    result = json.loads(
-        serve_deck_editor(
-            dest="deck.html",
-            workspace_dir=str(tmp_path),
-            open_browser=False,
-        )
-    )
-    assert result["success"] is True
-    assert result["editor"] is True
-    assert result["port"] > 0
-    assert result["url"].endswith("/deck.html")
-    assert result["reused"] is False
-    assert result["browser_opened"] is False
-    assert (
-        Path(result["layout_file"]).resolve()
-        == (tmp_path / "deck_layout.json").resolve()
-    )
-
-    with urllib.request.urlopen(result["url"], timeout=5) as response:
-        body = response.read()
-    assert b"deck" in body
-    assert b'<script src="/__editor.js"></script>' in body
-    assert b"__deck-editor-css" in body
-
-    base = result["url"].rsplit("/", 1)[0]
-    with urllib.request.urlopen(f"{base}/__editor.js", timeout=5) as response:
-        js = response.read()
-        assert response.headers.get_content_type() == "application/javascript"
-    assert b"deck-overlay" in js
-    assert b"__layout" in js
-
-
-def test_serve_deck_editor_layout_endpoints_roundtrip(tmp_path):
-    """Verify GET/POST /__layout serve and persist the deck layout."""
-    (tmp_path / "deck.html").write_text("<html><body>deck</body></html>")
-    result = json.loads(
-        serve_deck_editor(
-            dest="deck.html",
-            workspace_dir=str(tmp_path),
-            open_browser=False,
-        )
-    )
-    base = result["url"].rsplit("/", 1)[0]
-
-    with urllib.request.urlopen(f"{base}/__layout", timeout=5) as response:
-        assert json.loads(response.read()) == {}
-
-    payload = {
-        "version": 1,
-        "theme": "black",
-        "slides": [
-            {
-                "index": 0,
-                "order": 0,
-                "hidden": False,
-                "overlays": [
-                    {
-                        "id": "o1",
-                        "type": "text",
-                        "x": 10.0,
-                        "y": 20.0,
-                        "w": 40.0,
-                        "h": 15.0,
-                        "z": 0,
-                        "text": "Hello",
-                        "src": None,
-                        "color": "#ffffff",
-                        "font_size": 32.0,
-                    }
-                ],
-            }
-        ],
-    }
-    request = urllib.request.Request(
-        f"{base}/__layout",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=5) as response:
-        assert json.loads(response.read()) == {"success": True}
-
-    saved = json.loads(Path(result["layout_file"]).read_text(encoding="utf-8"))
-    assert saved == payload
-    with urllib.request.urlopen(f"{base}/__layout", timeout=5) as response:
-        assert json.loads(response.read()) == payload
-
-
-def test_serve_deck_editor_layout_post_rejects_bad_payloads(tmp_path):
-    """Verify POST /__layout rejects invalid JSON and non-versioned objects."""
-    (tmp_path / "deck.html").write_text("<html><body>deck</body></html>")
-    result = json.loads(
-        serve_deck_editor(
-            dest="deck.html",
-            workspace_dir=str(tmp_path),
-            open_browser=False,
-        )
-    )
-    base = result["url"].rsplit("/", 1)[0]
-
-    bad_json = urllib.request.Request(
-        f"{base}/__layout",
-        data=b"{not json",
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(bad_json, timeout=5)
-    assert excinfo.value.code == 400
-    payload = json.loads(excinfo.value.read())
-    assert payload["success"] is False
-    assert "error" in payload
-
-    no_version = urllib.request.Request(
-        f"{base}/__layout",
-        data=json.dumps({"theme": "black"}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(no_version, timeout=5)
-    assert excinfo.value.code == 400
-    payload = json.loads(excinfo.value.read())
-    assert payload["success"] is False
-    assert "version" in payload["error"]
-
-
-_APPLY_DECK_HTML = (
-    '<html><body><div class="reveal"><div class="slides">'
-    "<section>one</section>\n"
-    "<section>two</section>\n"
-    "<section>three</section>\n"
-    "</div></div></body></html>"
-)
-
-
-def _apply_layout_payload() -> dict:
-    """Return a layout that reorders 3 sections, hides one, adds 2 overlays."""
-    return {
-        "version": 1,
-        "theme": "black",
-        "slides": [
-            {
-                "index": 2,
-                "order": 0,
-                "hidden": False,
-                "overlays": [
-                    {
-                        "id": "o1",
-                        "type": "text",
-                        "x": 10.0,
-                        "y": 20.0,
-                        "w": 40.0,
-                        "h": 15.0,
-                        "z": 0,
-                        "text": "Hello",
-                        "src": None,
-                        "color": "#ffffff",
-                        "font_size": 32.0,
-                    }
-                ],
-            },
-            {"index": 0, "order": 1, "hidden": True, "overlays": []},
-            {
-                "index": 1,
-                "order": 2,
-                "hidden": False,
-                "overlays": [
-                    {
-                        "id": "o2",
-                        "type": "image",
-                        "x": 60.0,
-                        "y": 10.0,
-                        "w": 30.0,
-                        "h": 40.0,
-                        "z": 1,
-                        "text": None,
-                        "src": "https://example.com/img.png",
-                        "color": None,
-                        "font_size": None,
-                    }
-                ],
-            },
-        ],
-    }
-
-
-def test_apply_deck_layout_reorders_hides_and_injects(tmp_path):
-    """Verify apply_deck_layout reorders, drops hidden, and injects overlays."""
-    deck = tmp_path / "deck.html"
-    deck.write_text(_APPLY_DECK_HTML)
-    (tmp_path / "deck_layout.json").write_text(json.dumps(_apply_layout_payload()))
-
-    result = json.loads(
-        apply_deck_layout(dest="deck.html", workspace_dir=str(tmp_path))
-    )
-    assert result["success"] is True
-    assert Path(result["dest"]).resolve() == deck.resolve()
-    assert result["sections"] == 2
-    assert result["hidden_removed"] == 1
-    assert result["overlays_injected"] == 2
-
-    baked = deck.read_text(encoding="utf-8")
-    assert ">one<" not in baked
-    assert baked.index(">three<") < baked.index(">two<")
-    assert 'data-overlay-id="o1"' in baked
-    assert 'data-overlay-id="o2"' in baked
-    assert "position:absolute;left:10%;top:20%;width:40%;height:15%;z-index:0;" in baked
-    assert "position:absolute;left:60%;top:10%;width:30%;height:40%;z-index:1;" in baked
-    assert "font-size:32px;color:#ffffff;" in baked
-    assert "Hello" in baked
-    assert '<img src="https://example.com/img.png"' in baked
-
-
-def test_apply_deck_layout_writes_out_file(tmp_path):
-    """Verify out= writes a new file and leaves dest untouched."""
-    deck = tmp_path / "deck.html"
-    deck.write_text(_APPLY_DECK_HTML)
-    (tmp_path / "deck_layout.json").write_text(json.dumps(_apply_layout_payload()))
-
-    result = json.loads(
-        apply_deck_layout(
-            dest="deck.html",
-            workspace_dir=str(tmp_path),
-            out="baked.html",
-        )
-    )
-    assert result["success"] is True
-    assert Path(result["dest"]).resolve() == (tmp_path / "baked.html").resolve()
-    assert deck.read_text(encoding="utf-8") == _APPLY_DECK_HTML
-    assert (tmp_path / "baked.html").is_file()
-
-
-def test_apply_deck_layout_missing_layout(tmp_path):
-    """Verify a missing layout file returns a clean error envelope."""
-    (tmp_path / "deck.html").write_text(_APPLY_DECK_HTML)
-    result = json.loads(
-        apply_deck_layout(dest="deck.html", workspace_dir=str(tmp_path))
-    )
-    assert result["success"] is False
-    assert "not found" in result["error"]
-
-
 def test_contact_sheet_no_scenes(tmp_path):
     """Verify contact_sheet reports an error when no scenes are rendered."""
     result = json.loads(contact_sheet(workspace_dir=str(tmp_path)))
@@ -2505,22 +2222,3 @@ async def test_server_list_tools_includes_screenshot_and_contact():
     contact_tool = next(t for t in tools if t.name == "contact_sheet")
     assert "columns" in contact_tool.input_schema["properties"]
     assert "tile_width" in contact_tool.input_schema["properties"]
-
-
-def test_apply_deck_layout_invalid_layout(tmp_path):
-    """Verify unparseable and versionless layouts return error envelopes."""
-    (tmp_path / "deck.html").write_text(_APPLY_DECK_HTML)
-
-    (tmp_path / "deck_layout.json").write_text("{not json")
-    result = json.loads(
-        apply_deck_layout(dest="deck.html", workspace_dir=str(tmp_path))
-    )
-    assert result["success"] is False
-    assert "error" in result
-
-    (tmp_path / "deck_layout.json").write_text(json.dumps({"theme": "black"}))
-    result = json.loads(
-        apply_deck_layout(dest="deck.html", workspace_dir=str(tmp_path))
-    )
-    assert result["success"] is False
-    assert "version" in result["error"]
