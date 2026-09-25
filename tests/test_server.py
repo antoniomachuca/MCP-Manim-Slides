@@ -882,13 +882,9 @@ async def test_execute_manim_code_partial_cache_hit_renders_only_missed(
             "stderr": "",
         }
 
-    monkeypatch.setattr(
-        "mcp_manim_slides.server._run_render_streaming", fake_render
-    )
+    monkeypatch.setattr("mcp_manim_slides.server._run_render_streaming", fake_render)
     result = json.loads(
-        await execute_manim_code(
-            code=code, scenes=["A", "B"], media_dir=str(tmp_path)
-        )
+        await execute_manim_code(code=code, scenes=["A", "B"], media_dir=str(tmp_path))
     )
     assert result["success"] is True
     assert render_calls == [["B"]]
@@ -1007,11 +1003,7 @@ def test_sync_deck_renders_reuses_and_removes(monkeypatch, tmp_path):
     assert third["scene_cache"] == {"A": True, "B": False}
     assert render_calls == [["A", "B"], ["B"]]
 
-    code_only_a = (
-        "class A(Slide):\n"
-        "    def construct(self):\n"
-        "        pass\n"
-    )
+    code_only_a = "class A(Slide):\n    def construct(self):\n        pass\n"
     fourth = json.loads(
         sync_deck(code=code_only_a, media_dir=str(tmp_path), dest="deck.html")
     )
@@ -1920,9 +1912,7 @@ def test_screenshot_deck_playwright_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "mcp_manim_slides.server._module_available", lambda _name: False
     )
-    result = json.loads(
-        screenshot_deck(dest="deck.html", workspace_dir=str(tmp_path))
-    )
+    result = json.loads(screenshot_deck(dest="deck.html", workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert "playwright install chromium" in result["error"]
 
@@ -1939,9 +1929,7 @@ def test_screenshot_deck_success_fake_capture(monkeypatch, tmp_path):
         return [
             {
                 "index": index,
-                "slide_path": str(
-                    (out_dir / f"deck_slide_{index}.png").resolve()
-                ),
+                "slide_path": str((out_dir / f"deck_slide_{index}.png").resolve()),
             }
             for index in indices
         ]
@@ -1994,9 +1982,7 @@ def test_screenshot_deck_bad_output_format(tmp_path):
 
 def test_screenshot_deck_missing_dest(tmp_path):
     """Verify screenshot_deck reports an error for a missing deck."""
-    result = json.loads(
-        screenshot_deck(dest="nope.html", workspace_dir=str(tmp_path))
-    )
+    result = json.loads(screenshot_deck(dest="nope.html", workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert "not found" in result["error"]
 
@@ -2030,9 +2016,7 @@ def test_serve_deck_editor_missing_file(tmp_path):
 def test_screenshot_deck_rejects_non_html(tmp_path):
     """Verify screenshot_deck rejects a non-HTML file."""
     (tmp_path / "deck.pdf").write_text("not html")
-    result = json.loads(
-        screenshot_deck(dest="deck.pdf", workspace_dir=str(tmp_path))
-    )
+    result = json.loads(screenshot_deck(dest="deck.pdf", workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert ".html" in result["error"]
 
@@ -2040,9 +2024,7 @@ def test_screenshot_deck_rejects_non_html(tmp_path):
 def test_serve_deck_editor_rejects_non_html(tmp_path):
     """Verify serve_deck_editor rejects a non-HTML file."""
     (tmp_path / "deck.pdf").write_text("not html")
-    result = json.loads(
-        serve_deck_editor(dest="deck.pdf", workspace_dir=str(tmp_path))
-    )
+    result = json.loads(serve_deck_editor(dest="deck.pdf", workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert ".html" in result["error"]
 
@@ -2205,9 +2187,7 @@ def test_contact_sheet_ffmpeg_failure(monkeypatch, tmp_path):
         "mcp_manim_slides.server._ffmpeg_executable",
         lambda: "/usr/bin/ffmpeg",
     )
-    result = json.loads(
-        contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path))
-    )
+    result = json.loads(contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert "bogus filter" in result["error"]
 
@@ -2223,9 +2203,7 @@ def test_contact_sheet_ffmpeg_missing(monkeypatch, tmp_path):
         "mcp_manim_slides.server._ffmpeg_executable",
         lambda: None,
     )
-    result = json.loads(
-        contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path))
-    )
+    result = json.loads(contact_sheet(scenes=["MySlide"], workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert "ffmpeg executable not found" in result["error"]
 
@@ -2246,9 +2224,7 @@ async def test_server_list_tools_includes_export_video():
 
 def test_contact_sheet_missing_scene(tmp_path):
     """Verify contact_sheet reports an error when the scene is not found."""
-    result = json.loads(
-        contact_sheet(scenes=["Nope"], workspace_dir=str(tmp_path))
-    )
+    result = json.loads(contact_sheet(scenes=["Nope"], workspace_dir=str(tmp_path)))
     assert result["success"] is False
     assert "not found" in result["error"]
 
@@ -2269,9 +2245,10 @@ def test_serve_deck_editor_success_injects_editor(tmp_path):
     assert result["url"].endswith("/deck.html")
     assert result["reused"] is False
     assert result["browser_opened"] is False
-    assert Path(result["layout_file"]).resolve() == (
-        tmp_path / "deck_layout.json"
-    ).resolve()
+    assert (
+        Path(result["layout_file"]).resolve()
+        == (tmp_path / "deck_layout.json").resolve()
+    )
 
     with urllib.request.urlopen(result["url"], timeout=5) as response:
         body = response.read()
@@ -2383,7 +2360,7 @@ def test_serve_deck_editor_layout_post_rejects_bad_payloads(tmp_path):
 
 
 _APPLY_DECK_HTML = (
-    "<html><body><div class=\"reveal\"><div class=\"slides\">"
+    '<html><body><div class="reveal"><div class="slides">'
     "<section>one</section>\n"
     "<section>two</section>\n"
     "<section>three</section>\n"
@@ -2507,9 +2484,7 @@ def test_contact_sheet_no_scenes(tmp_path):
 
 def test_contact_sheet_invalid_columns(tmp_path):
     """Verify contact_sheet rejects invalid grid arguments before ffmpeg."""
-    result = json.loads(
-        contact_sheet(workspace_dir=str(tmp_path), columns=0)
-    )
+    result = json.loads(contact_sheet(workspace_dir=str(tmp_path), columns=0))
     assert result["success"] is False
     assert "columns" in result["error"]
 

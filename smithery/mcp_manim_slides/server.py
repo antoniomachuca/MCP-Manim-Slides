@@ -1450,8 +1450,7 @@ def apply_deck_layout(
                 {
                     "success": False,
                     "error": (
-                        f"Layout slide {position} 'overlays' must be a "
-                        "list of objects."
+                        f"Layout slide {position} 'overlays' must be a list of objects."
                     ),
                 },
                 indent=2,
@@ -2325,8 +2324,7 @@ def contact_sheet(
                     {
                         "success": False,
                         "error": (
-                            f"Contact sheet generation timed out after "
-                            f"{timeout}s: {e}"
+                            f"Contact sheet generation timed out after {timeout}s: {e}"
                         ),
                     },
                     indent=2,
@@ -2699,8 +2697,7 @@ def export_video(
             {
                 "success": False,
                 "error": (
-                    f"width and height must be positive integers, "
-                    f"got {width}x{height}."
+                    f"width and height must be positive integers, got {width}x{height}."
                 ),
             },
             indent=2,
@@ -2712,8 +2709,7 @@ def export_video(
             {
                 "success": False,
                 "error": (
-                    "ffmpeg executable not found. "
-                    "Install FFmpeg to export videos."
+                    "ffmpeg executable not found. Install FFmpeg to export videos."
                 ),
             },
             indent=2,
@@ -2721,9 +2717,7 @@ def export_video(
 
     destination = Path(cwd or ".").joinpath(dest).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    media = [
-        {"path": str(entry["path"]), "type": entry["type"]} for entry in slides
-    ]
+    media = [{"path": str(entry["path"]), "type": entry["type"]} for entry in slides]
     deadline = time.monotonic() + timeout
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -2731,8 +2725,7 @@ def export_video(
         with tempfile.TemporaryDirectory(prefix="manim_export_") as tmp:
             workdir = Path(tmp)
             segment_paths = [
-                str(workdir / f"segment_{index:03d}.mp4")
-                for index in range(len(media))
+                str(workdir / f"segment_{index:03d}.mp4") for index in range(len(media))
             ]
             concat_list_path = workdir / "concat.txt"
             # Normalization is transition-independent; the fade offsets can
@@ -2770,8 +2763,7 @@ def export_video(
                         {
                             "success": False,
                             "error": (
-                                result.stderr.strip()
-                                or "Unknown video export error."
+                                result.stderr.strip() or "Unknown video export error."
                             ),
                             "stdout": result.stdout.strip(),
                             "stderr": result.stderr.strip(),
@@ -2785,8 +2777,7 @@ def export_video(
                     {
                         "success": False,
                         "error": (
-                            "Could not determine slide segment durations "
-                            "with ffprobe."
+                            "Could not determine slide segment durations with ffprobe."
                         ),
                     },
                     indent=2,
@@ -2831,9 +2822,10 @@ def export_video(
                 )
         segment_durations = [duration for duration in durations if duration is not None]
         if transition == "fade" and len(segment_durations) > 1:
-            total_duration = sum(segment_durations) - (
-                len(segment_durations) - 1
-            ) * transition_duration
+            total_duration = (
+                sum(segment_durations)
+                - (len(segment_durations) - 1) * transition_duration
+            )
         else:
             total_duration = sum(segment_durations)
         return json.dumps(
