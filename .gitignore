@@ -73,3 +73,9 @@ demo/out/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Demo video source (HyperFrames) and its rendered outputs
+!demo/**/*.html
+!demo/index.html
+!demo/assets/deck.mp4
+!assets/demo.mp4

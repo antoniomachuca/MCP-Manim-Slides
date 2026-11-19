@@ -1,0 +1,95 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      font-family: "Inter", sans-serif;
+      overflow: hidden;
+    }
+    #rs-ground {
+      position: absolute;
+      inset: 0;
+      background: #0d0d0f;
+    }
+    #rs-win {
+      position: absolute;
+      left: 180px;
+      top: 78px;
+      width: 1560px;
+      height: 926px;
+      border-radius: 18px;
+      background: #16171b;
+      overflow: hidden;
+      box-shadow: 0 30px 80px rgba(23, 23, 26, 0.28);
+    }
+    .bar {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 0;
+      height: 48px;
+      background: #ffffff;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 20px;
+      font-size: 26px;
+      font-weight: 600;
+      color: #3a3a3e;
+    }
+    .dot { width: 13px; height: 13px; border-radius: 7px; background: #dcdad3; }
+    .bar .name { margin-left: 16px; }
+    .bar .meta { margin-left: auto; color: #6d6c68; font-weight: 500; }
+    .stage {
+      position: absolute;
+      left: 0;
+      top: 48px;
+      width: 1560px;
+      height: 878px;
+    }
+    #rs-video {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1560px;
+      height: 878px;
+      object-fit: cover;
+    }
+    #rs-sheet {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1560px;
+      height: 878px;
+      background: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #rs-sheet img { width: 1560px; height: 585px; }
+  </style>
+  <div id="root" data-composition-id="result" data-width="1920" data-height="1080">
+    <div id="rs-ground"></div>
+    <div id="rs-win">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="name" style="position:relative;width:420px;height:32px"><span id="rs-n1" style="position:absolute;left:0;top:0;line-height:32px">contact_sheet.png</span><span id="rs-n2" style="position:absolute;left:0;top:0;line-height:32px">deck.mp4</span></span><span class="meta">export_video · 6 slides · 1080p60</span></div>
+      <div class="stage">
+        <video id="rs-video" class="clip" src="assets/deck.mp4" data-start="0.25" data-duration="7.15" data-media-start="4.0" data-track-index="1" muted playsinline></video>
+        <div id="rs-sheet"><img src="assets/contact_sheet.png" alt="" /></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      const tl = gsap.timeline({ paused: true });
+      // The contact sheet card from the terminal grows into the player; the night lifts.
+      tl.fromTo("#rs-ground", { backgroundColor: "#0d0d0f" }, { backgroundColor: "#f1f0ec", duration: 0.6, ease: "power2.inOut" }, 0);
+      tl.fromTo("#rs-win", { scale: 0.769 }, { scale: 1, duration: 0.65, ease: "power3.inOut" }, 0);
+      tl.fromTo("#rs-sheet", { opacity: 1 }, { opacity: 0, duration: 0.3, ease: "power2.out" }, 0.4);
+      tl.fromTo("#rs-n1", { opacity: 1 }, { opacity: 0, duration: 0.2 }, 0.4);
+      tl.fromTo("#rs-n2", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 0.45);
+      // Leave cleanly into the end card.
+      tl.to("#rs-win", { scale: 0.9, opacity: 0, filter: "blur(10px)", duration: 0.35, ease: "power3.in" }, 6.85);
+      window.__timelines["result"] = tl;
+    })();
+  </script>
+</template>

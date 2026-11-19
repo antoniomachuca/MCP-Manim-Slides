@@ -1,0 +1,94 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: var(--color-ground, #f1f0ec);
+      font-family: "Inter", sans-serif;
+      overflow: hidden;
+    }
+    .pill {
+      position: absolute;
+      left: 410px;
+      top: 492px;
+      width: 1100px;
+      height: 96px;
+      border-radius: 48px;
+      background: #ffffff;
+      box-shadow: 0 1px 0 rgba(0, 0, 0, 0.04), 0 18px 50px rgba(23, 23, 26, 0.12);
+      display: flex;
+      align-items: center;
+      padding: 0 30px 0 36px;
+      gap: 22px;
+    }
+    .pill svg {
+      flex: none;
+    }
+    .pill-text {
+      flex: 1;
+      font-size: 40px;
+      font-weight: 600;
+      color: #17171a;
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+    }
+    .caret {
+      display: inline-block;
+      width: 3px;
+      height: 44px;
+      background: #17171a;
+      margin-left: 3px;
+      vertical-align: -8px;
+    }
+    .enter {
+      flex: none;
+      width: 52px;
+      height: 52px;
+      border-radius: 26px;
+      background: #f1f0ec;
+      color: #8b8a86;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 28px;
+    }
+  </style>
+  <div id="root" data-composition-id="ask" data-width="1920" data-height="1080">
+    <div id="ask-pill" class="pill">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#17171a" stroke-width="2.4" stroke-linecap="round">
+        <circle cx="10.5" cy="10.5" r="6.5" />
+        <path d="M15.5 15.5 L21 21" />
+      </svg>
+      <div class="pill-text"><span id="ask-typed"></span><span id="ask-caret" class="caret"></span></div>
+      <div id="ask-enter" class="enter">↵</div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      const tl = gsap.timeline({ paused: true });
+      const full = "Make a three-slide deck on the Pythagorean theorem";
+      const typed = document.querySelector("#ask-typed");
+      const proxy = { n: 4 };
+      typed.textContent = full.slice(0, 4);
+
+      tl.fromTo(
+        proxy,
+        { n: 4 },
+        {
+          n: full.length,
+          duration: 2.3,
+          ease: "none",
+          onUpdate: () => {
+            typed.textContent = full.slice(0, Math.round(proxy.n));
+          },
+        },
+        0.05,
+      );
+      tl.fromTo("#ask-enter", { backgroundColor: "#f1f0ec", color: "#8b8a86" }, { backgroundColor: "#17171a", color: "#ffffff", duration: 0.12 }, 2.5);
+      tl.fromTo("#ask-caret", { opacity: 1 }, { opacity: 0, duration: 0.05 }, 2.6);
+      // The question rises and becomes the task header of the next shot.
+      tl.fromTo("#ask-pill", { y: 0, scale: 1 }, { y: -465, scale: 0.72, duration: 0.6, ease: "power2.inOut" }, 2.72);
+      window.__timelines["ask"] = tl;
+    })();
+  </script>
+</template>

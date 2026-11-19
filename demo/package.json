@@ -1,18 +1,11 @@
 {
-  "name": "manim-slides-demo",
+  "name": "demo",
   "private": true,
+  "type": "module",
   "scripts": {
-    "render": "remotion render src/index.ts Demo out/demo.mp4"
-  },
-  "dependencies": {
-    "@remotion/cli": "^4.0.0",
-    "@remotion/google-fonts": "^4.0.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "remotion": "^4.0.0"
-  },
-  "devDependencies": {
-    "@types/react": "^19.0.0",
-    "typescript": "^5.8.0"
+    "dev": "npx --yes hyperframes@0.9.70 preview",
+    "check": "npx --yes hyperframes@0.9.70 check",
+    "render": "npx --yes hyperframes@0.9.70 render",
+    "publish": "npx --yes hyperframes@0.9.70 publish"
   }
 }
