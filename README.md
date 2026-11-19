@@ -22,9 +22,9 @@ While traditional AI coding assistants can write Manim code, executing that code
 
 ## Demo
 
-![Manim-Slides MCP Demo](assets/demo.gif)
+Claude Code renders a deck through the server with live progress, reviews it with `contact_sheet`, fixes the scene whose labels are too small, and re-syncs only that scene with `sync_deck`. The terminal output is the real tool output from that run.
 
-Claude Code renders a deck through the server with live progress, reviews it with `contact_sheet`, fixes the scene whose labels are too small, and re-syncs only that scene with `sync_deck`. The terminal output is the real tool output from that run. [Watch it with sound (MP4)](assets/demo.mp4). The video is a [HyperFrames](https://hyperframes.heygen.com) project in [`demo/`](demo/).
+[Watch the demo (MP4, with sound)](assets/demo.mp4)
 
 ## Features
 

@@ -48,22 +48,16 @@ manim.cfg
 
 # Manim Slides specific
 slides/
-!demo/public/slides/
-!demo/public/slides/deck.mp4
 preview/
 *.html
 *.mp4
-!demo/public/slides/deck.mp4
+!assets/demo.mp4
 
 # IDEs
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# Remotion demo
-demo/node_modules/
-demo/out/
 
 # OS generated files
 .DS_Store
@@ -74,8 +68,3 @@ demo/out/
 ehthumbs.db
 Thumbs.db
 
-# Demo video source (HyperFrames) and its rendered outputs
-!demo/**/*.html
-!demo/index.html
-!demo/assets/deck.mp4
-!assets/demo.mp4
